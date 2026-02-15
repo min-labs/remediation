@@ -778,41 +778,75 @@ impl TxCounter {
 
 // ============================================================================
 // JITTER BUFFER — RFC 3550 EWMA + circular release buffer
+// ENFORCED DETERMINISM: ZERO FLOATING POINT. STRICT Q60.4 FIXED-POINT MATH.
 // ============================================================================
 
 pub const JBUF_CAPACITY: usize = 128;
 
 /// Adaptive jitter estimator using RFC 3550 EWMA.
+/// Architecture: Q60.4 Fixed-Point DSP Math.
+///
+/// Internal state `jitter_q4` stores `jitter_ns * 16`, preserving 1/16th
+/// nanosecond fractional resolution using integer-only arithmetic.
+///
+/// Formula derivation from RFC 3550:
+///   J = J + (|D| - J) / 16
+///   Let J_q4 = 16·J  →  J_q4 = J_q4 - (J_q4 >> 4) + |D|
+///
+/// Underflow safety: (J_q4 >> 4) ≤ J_q4 for all non-negative J_q4.
+/// Overflow safety: max J_q4 ≈ 16 × 30×10⁹ ≈ 39 bits. Within u64.
 pub struct JitterEstimator {
-    jitter_ns: f64,
+    /// Jitter state in Q60.4 format (jitter_ns × 16).
+    jitter_q4: u64,
     last_transit: i64,
     initialized: bool,
 }
 
 impl JitterEstimator {
+    #[inline(always)]
     pub fn new() -> Self {
-        JitterEstimator { jitter_ns: 0.0, last_transit: 0, initialized: false }
+        JitterEstimator { jitter_q4: 0, last_transit: 0, initialized: false }
     }
+
+    #[inline(always)]
     pub fn update(&mut self, send_ts_ns: u64, recv_ts_ns: u64) {
-        let transit = recv_ts_ns as i64 - send_ts_ns as i64;
+        let transit = (recv_ts_ns as i64).wrapping_sub(send_ts_ns as i64);
+
         if !self.initialized {
             self.last_transit = transit;
             self.initialized = true;
             return;
         }
-        let d = (transit - self.last_transit).unsigned_abs() as f64;
+
+        // |D| = absolute transit difference. abs_diff returns u64, no panic.
+        let d = transit.abs_diff(self.last_transit);
         self.last_transit = transit;
-        self.jitter_ns += (d - self.jitter_ns) / 16.0;
+
+        // RFC 3550 EWMA in Q60.4: J_q4 = J_q4 - (J_q4 >> 4) + |D|
+        // wrapping ops elide panic branches in emitted assembly.
+        self.jitter_q4 = self.jitter_q4
+            .wrapping_sub(self.jitter_q4 >> 4)
+            .wrapping_add(d);
     }
-    pub fn jitter_us(&self) -> u64 { (self.jitter_ns / 1000.0) as u64 }
-    /// Return jitter estimate in nanoseconds.
-    pub fn get(&self) -> u64 { self.jitter_ns as u64 }
+
+    /// Jitter estimate in microseconds (for telemetry export).
+    #[inline(always)]
+    pub fn jitter_us(&self) -> u64 { (self.jitter_q4 >> 4) / 1000 }
+
+    /// Jitter estimate in nanoseconds.
+    #[inline(always)]
+    pub fn get(&self) -> u64 { self.jitter_q4 >> 4 }
 }
 
 /// Entry in jitter buffer: UMEM address + length.
+#[derive(Clone, Copy)]
 pub struct JBufEntry {
     pub addr: u64,
     pub len: u32,
+}
+
+impl Default for JBufEntry {
+    fn default() -> Self { Self { addr: 0, len: 0 } }
 }
 
 /// Circular jitter buffer with adaptive depth.
@@ -829,7 +863,7 @@ pub struct JitterBuffer {
 impl JitterBuffer {
     pub fn new() -> Self {
         JitterBuffer {
-            entries: std::array::from_fn(|_| JBufEntry { addr: 0, len: 0 }),
+            entries: [JBufEntry::default(); JBUF_CAPACITY],
             head: 0, tail: 0,
             estimator: JitterEstimator::new(),
             total_releases: 0, total_drops: 0,
@@ -837,6 +871,7 @@ impl JitterBuffer {
         }
     }
 
+    #[inline(always)]
     pub fn push(&mut self, addr: u64, len: u32) -> bool {
         let next = (self.tail + 1) & (JBUF_CAPACITY - 1);
         if next == self.head {
@@ -844,30 +879,33 @@ impl JitterBuffer {
             return false;
         }
         self.entries[self.tail] = JBufEntry { addr, len };
-        self.tail = (self.tail + 1) & (JBUF_CAPACITY - 1);
+        self.tail = next;
         true
     }
 
     /// Drain all entries whose release time has arrived.
     /// Returns (released_count, frames_still_buffered).
+    #[inline(always)]
     pub fn drain(&mut self, _now_ns: u64, scheduler: &mut Scheduler) -> (u64, usize) {
         let mut released = 0u64;
         while self.head != self.tail {
             let slot = self.head & (JBUF_CAPACITY - 1);
             let entry = &self.entries[slot];
             scheduler.enqueue_bulk(entry.addr, entry.len);
-            self.head += 1;
+            self.head = (self.head + 1) & (JBUF_CAPACITY - 1);
             self.total_releases += 1;
             released += 1;
         }
         (released, 0)
     }
 
+    #[inline(always)]
     pub fn len(&self) -> usize {
         if self.tail >= self.head { self.tail - self.head }
         else { JBUF_CAPACITY - self.head + self.tail }
     }
 
+    #[inline(always)]
     pub fn is_empty(&self) -> bool { self.head == self.tail }
 }
 

@@ -97,6 +97,29 @@ Below is the uncompromising, fiduciary-grade technical debt ledger.
 
 ---
 
+### ✅ SPRINT R-03: FPU POLLUTION ERADICATION (COMPLETED 2026-02-15)
+
+**Scope:** Eradicate IEEE 754 double-precision floating-point (`f64`) from the Hub's `JitterEstimator` in the datapath hot-loop. Replace with Q60.4 fixed-point integer math per RFC 3550 §A.8.
+
+**Files Modified:**
+
+| File | Action | Summary |
+| --- | --- | --- |
+| `hub/src/engine/protocol.rs` | **PATCHED** | `JitterEstimator.jitter_ns: f64` → `jitter_q4: u64`. EWMA update rewritten: `wrapping_sub(jitter_q4 >> 4) + |D|`. `JBufEntry` gained `#[derive(Clone, Copy)]` + `Default`. All jitter buffer methods `#[inline(always)]`. |
+| `PROTOCOL.md` | **PATCHED** | §1.3 hardware constraint corrected: `Cortex-A76` → `Cortex-A53` (Kria K26 SOM). §4.4 Local Backup added. |
+
+**Eradicated Constructs:** `f64` type, `/ 16.0` FP division, `as f64` cast, `/ 1000.0` FP division.
+
+**Added Constructs:** `jitter_q4: u64` (Q60.4), `wrapping_sub`/`wrapping_add`, `abs_diff`, `Default for JBufEntry`.
+
+**Self-Audit:**
+- Zero `f64` or `f32` in Hub workspace (verified by `grep`)
+- API surface unchanged: `update()`, `get()`, `jitter_us()` signatures identical
+- No live deployment — mathematical equivalence replacement, server destroyed after R-02
+- Live telemetry validation deferred to next sprint with server
+
+---
+
 ### P0 FATAL DEBT: OS PHYSICS & KINETIC SURVIVAL
 
 #### [DEBT-P0-01] The `io_uring` Contradiction & VFS Syscall Avalanche (Node & Hub)

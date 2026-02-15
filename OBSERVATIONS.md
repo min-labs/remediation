@@ -302,6 +302,40 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 
 ---
 
+## Sprint R-03: FPU Pollution Eradication
+
+**Date**: 2026-02-15
+**Scope**: Replace `f64` in Hub `JitterEstimator` with Q60.4 fixed-point integer math. Eradicate all floating-point types from the Hub workspace.
+
+### Changes
+- `JitterEstimator.jitter_ns: f64` → `jitter_q4: u64` (Q60.4 fixed-point)
+- RFC 3550 EWMA: `self.jitter_ns += (d - self.jitter_ns) / 16.0` → `self.jitter_q4 = self.jitter_q4.wrapping_sub(self.jitter_q4 >> 4).wrapping_add(d)`
+- `JBufEntry` gained `#[derive(Clone, Copy)]` + `Default` impl
+- Added `#[inline(always)]` to all jitter buffer methods
+- Files: `hub/src/engine/protocol.rs` (1 file, 1 struct, 3 methods)
+
+### Telemetry
+
+> **No live deployment.** Sprint R-03 is a mathematical equivalence replacement — the Q60.4
+> formula produces identical results to the `f64` version within ±1ns integer truncation.
+> Live server was destroyed after R-02 to conserve cost. The change does not alter external
+> behavior, wire protocol, or call sites. Verification was performed statically:
+
+| Check | Result |
+|-------|--------|
+| `grep -rn 'f64' --include='*.rs' hub/` | **0 results** — eradication confirmed |
+| `grep -rn 'f32' --include='*.rs' hub/` | **0 results** — no FP types in Hub |
+| `cargo build --release` | **0 warnings** — clean compile |
+| API surface change | **None** — `update()`, `get()`, `jitter_us()` signatures identical |
+| Call site changes | **None** — `JitterBuffer` wraps estimator; no external callers |
+| Algebraic equivalence | **Verified** — Q60.4 derivation matches RFC 3550 §A.8 |
+
+> **Live telemetry validation deferred to next sprint with a live server.**
+> The `jbuf_jitter_us` SHM counter will confirm the estimator produces non-zero,
+> converging values when packets flow.
+
+---
+
 ## Cross-Sprint Comparison (Normalized)
 
 > **One row per sprint, fixed columns.** Cells marked `—` = not measured that sprint.
@@ -315,6 +349,7 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-01 | 2026-02-15 | — | — | — | — | — | — | — | — | — |
 | R-02A | 2026-02-15 | — | 990 | 963 | 963 | 979 | 983 | 986 | 982 | 965 |
 | R-02B | 2026-02-15 | — | 69,275 | 180,429 | 180,429 | 69,264 | 167,002 | 70,025 | 70,021 | 166,981 |
+| R-03 | 2026-02-15 | — | — | — | — | — | — | — | — | — |
 
 ### Correctness
 
@@ -323,6 +358,7 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-01 | — | — | — | — | — | — | — | — | — |
 | R-02A | 978 | **0** | 965 | **0** | **0** | 1 | 0 | 0 | 1539 |
 | R-02B | 69,263 | **0** | 166,981 | **0** | **0** | 1 | 0 | 0 | 1542 |
+| R-03 | — | — | — | — | — | — | — | — | — |
 
 ### Loss (WAN-side)
 
@@ -331,6 +367,7 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-01 | — | — | — | — |
 | R-02A | −4 (timing) | ~0% | −20 (timing) | ~0% |
 | R-02B | 750 | 1.07% | 13,427 | 7.44% |
+| R-03 | — | — | — | — |
 
 ### Network Quality (External Measurement)
 
@@ -339,6 +376,7 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-01 | — | — | — | — | — | — | — |
 | R-02A | — | — | — | — | — | — | — |
 | R-02B | — | — | — | — | — | — | — |
+| R-03 | — | — | — | — | — | — | — |
 
 > **Action required:** Populate Network Quality table by running `ping` and `iperf3`
 > through the tunnel after each sprint deployment. See Measurement Capture Commands above.
@@ -350,6 +388,7 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-01 | — | — | — | — | — |
 | R-02A | — | — | — | — | — |
 | R-02B | 33 | 30 | 17 | 80 | 100% |
+| R-03 | — | — | — | — | — |
 
 ### Sprint-over-Sprint Δ
 
@@ -362,6 +401,14 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | Reconnections | 0 → 0 | **Stable** | No session drops |
 | Upstream Loss % | ~0% → 1.07% | ↑ | WAN-dependent, not regression |
 | Downstream Loss % | ~0% → 7.44% | ↑ | WAN-dependent, longer exposure |
+
+| Metric | R-02B → R-03 | Direction | Notes |
+|--------|--------------|-----------|-------|
+| `f64` in Hub | 1 occurrence → 0 | ↓ **Eradicated** | Q60.4 fixed-point replacement |
+| `f32` in Hub | 0 → 0 | **Stable** | Never present |
+| FPU instructions in JitterEstimator | FDIV + FADD + FSUB | **Eradicated** | SUB + ADD + LSR only |
+| API surface | Identical | **Stable** | `update()`, `get()`, `jitter_us()` unchanged |
+| Live telemetry | Not captured | — | Server destroyed; deferred to next live deployment |
 
 ---
 

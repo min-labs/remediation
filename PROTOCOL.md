@@ -57,7 +57,7 @@ For each assumption or technique in the sprint, search:
 | **Kernel Docs** | `Documentation/networking/af_xdp.rst`, `io_uring.rst`, relevant `man` pages |
 | **Vendor References** | Intel/ARM optimization manuals, NIC datasheets, DPDK guides |
 | **Academic Papers** | Peer-reviewed publications for algorithms (HKDF, RLNC, BBR) |
-| **Industry Practice** | How do WireGuard, Cloudflare, Meta, Google handle the same problem? |
+| **Industry Practice** | How do HFT, WireGuard, Cloudflare, Google, Hyperscaler, Starlink, Youtube, Instagram, Tiktok, Facebook, Netflix, Lockheed Martin handle the same problem? (Must search for all of them, not just one.) |
 | **Crate Documentation** | `docs.rs` for any new dependency — verify API correctness, not just examples |
 
 ### 1.3 Context-Appropriate Adjustment
@@ -66,7 +66,7 @@ Not every industry practice applies to M13. Filter through:
 
 - **Deployment context**: Single-Node satellite uplink, not datacenter. Latency > 20ms, loss > 1%.
 - **Threat model**: Post-quantum adversary, contested spectrum. Not just TLS web traffic.
-- **Hardware constraints**: ARM Cortex-A76 (4-wide OoO), not Xeon. NEON, not AVX-512.
+- **Hardware constraints**: ARM Cortex-A53 (2-wide in-order, Kria K26 SOM), not Xeon. NEON, not AVX-512.
 - **Scale**: 1–16 peers, not 100K. Optimize for per-packet latency, not connection count.
 
 ### 1.4 Mutual Agreement Gate
