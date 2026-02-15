@@ -638,14 +638,17 @@ pub fn run_monitor(max_workers: usize) {
         // Security counters
         let aead_ok = workers[0].decrypt_ok.value.load(Ordering::Relaxed);
         let aead_fail = workers[0].auth_fail.value.load(Ordering::Relaxed);
+        let hs_ok = workers[0].handshake_ok.value.load(Ordering::Relaxed);
+        let hs_fail = workers[0].handshake_fail.value.load(Ordering::Relaxed);
         // Per-stage cumulative TSC (raw cycles — divide by elapsed to get per-packet avg)
         let p_tsc = workers[0].parse_tsc_total.value.load(Ordering::Relaxed);
         let d_tsc = workers[0].decrypt_tsc_total.value.load(Ordering::Relaxed);
         let c_tsc = workers[0].classify_tsc_total.value.load(Ordering::Relaxed);
         let s_tsc = workers[0].scatter_tsc_total.value.load(Ordering::Relaxed);
         let t_tsc = workers[0].tun_write_tsc_total.value.load(Ordering::Relaxed);
-        eprint!("\r[TELEM] TX:{:<12} RX:{:<12} DROP:{:<10} PPS:{:<10} AEAD:{}/{} JB:{}us/{}us R:{} D:{} TSC:P{}|D{}|C{}|S{}|T{} CTX:[{}]   ",
+        eprint!("\r[TELEM] TX:{:<12} RX:{:<12} DROP:{:<10} PPS:{:<10} AEAD:{}/{} HS:{}/{} JB:{}us/{}us R:{} D:{} TSC:P{}|D{}|C{}|S{}|T{} CTX:[{}]   ",
             ttx, trx, td, tpps, aead_ok, aead_fail,
+            hs_ok, hs_fail,
             jb_depth, jb_jitter, jb_rel, jb_drop,
             p_tsc / 1000, d_tsc / 1000, c_tsc / 1000, s_tsc / 1000, t_tsc / 1000,
             cs);

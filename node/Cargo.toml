@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 libc = "0.2"
 ring = "0.17"
+io-uring = "0.7"   # io_uring SQPOLL + PBR (Sprint R-02B)
 bytemuck = { version = "1.14", features = ["derive"] }
 
 # PQC cold-path dependencies (handshake only)

@@ -165,6 +165,10 @@ fn make_test_ctx<'a>(
         now_ns: 1_000_000_000,
         umem_base: umem.as_mut_ptr(),
         frame_size: MOCK_FRAME_SIZE,
+        tx_tun_prod: None,
+        rx_tun_cons: None,
+        free_to_tun_prod: None,
+        free_to_dp_cons: None,
     }
 }
 

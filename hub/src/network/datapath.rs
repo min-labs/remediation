@@ -8,7 +8,7 @@
 // FIN bursts:  send_fin_burst_udp, send_fin_burst_l2
 // Cold paths:  handle_reconnection
 
-use crate::network::{PacketVector, PacketDesc, Disposition, NextNode, GraphCtx, CycleStats};
+use crate::network::{PacketVector, PacketDesc, Disposition, NextNode, GraphCtx, CycleStats, VECTOR_SIZE};
 use crate::engine::protocol::*;
 use crate::engine::protocol::{PeerAddr, MAX_PEERS};
 use crate::engine::protocol::Assembler;
@@ -439,18 +439,38 @@ pub fn tx_enqueue_vector(
 // TUN I/O — Read/write packets from/to the TUN interface
 // ============================================================================
 
-/// Write decrypted tunnel packets to the TUN fd.
+/// Write decrypted tunnel packets to the TUN interface.
+/// R-02: If SPSC ring is available, push PacketDesc to TX ring (ownership transfers to TUN thread).
+///       If no SPSC ring, fall back to direct VFS write.
 #[inline]
 pub fn tun_write_vector(
     input: &PacketVector,
     disp: &mut Disposition,
-    tun_fd: i32,
-    umem_base: *const u8,
+    ctx: &mut super::GraphCtx<'_>,
     stats: &mut CycleStats,
 ) {
     let n = input.len;
-    let mut i = 0;
+    if n == 0 { return; }
 
+    // R-02 SPSC PATH: Push packets to TUN thread. Slab ownership transfers.
+    if let Some(ref mut prod) = ctx.tx_tun_prod {
+        let pushed = prod.push_batch(&input.descs[..n]);
+        for i in 0..pushed {
+            disp.next[i] = NextNode::Consumed;
+            stats.tun_writes += 1;
+        }
+        // Backpressure: if ring was full, drop the remaining packets and free their slabs.
+        for i in pushed..n {
+            disp.next[i] = NextNode::Consumed;
+            ctx.slab.free((input.descs[i].addr / ctx.frame_size as u64) as u32);
+        }
+        return;
+    }
+
+    // FALLBACK: Direct VFS write (no SPSC ring, e.g. --no-tunnel or single-threaded mode)
+    let tun_fd = ctx.tun_fd;
+    let umem_base = ctx.umem_base as *const u8;
+    let mut i = 0;
     while i + 4 <= n {
         if i + 8 <= n {
             for k in 4..8 {
@@ -498,11 +518,63 @@ fn write_one_tun(desc: &PacketDesc, tun_fd: i32, umem_base: *const u8, stats: &m
 }
 
 /// Read IP packets from TUN and build M13 frames for wire TX.
+/// R-02: If SPSC ring is available, pop pre-built frames from TUN thread.
+///       Also drain free-index returns and provision empty slabs.
+///       If no SPSC ring, fall back to direct VFS read.
 #[inline]
 pub fn tun_read_batch(
     output: &mut PacketVector,
     ctx: &mut super::GraphCtx<'_>,
 ) -> usize {
+    // R-02: Drain free slab indices returned by TUN thread
+    if let Some(ref mut free_cons) = ctx.free_to_dp_cons {
+        let mut free_buf = [0u32; 64];
+        let freed = free_cons.pop_batch(&mut free_buf);
+        for i in 0..freed {
+            ctx.slab.free(free_buf[i]);
+        }
+    }
+
+    // R-02: Demand-Driven Provisioning (AF_XDP Fill Ring pattern)
+    // Only provision what the ring can accept to prevent slab pool drain
+    if let Some(ref mut free_prod) = ctx.free_to_tun_prod {
+        let ring_space = free_prod.available();
+        let provision_cap = ring_space.min(64); // Max batch size, bounded by ring space
+
+        if provision_cap > 0 {
+            let mut slab_buf = [0u32; 64];
+            let mut slab_count = 0;
+            while slab_count < provision_cap {
+                if let Some(idx) = ctx.slab.alloc() {
+                    slab_buf[slab_count] = idx;
+                    slab_count += 1;
+                } else {
+                    break;
+                }
+            }
+            if slab_count > 0 {
+                let pushed = free_prod.push_batch(&slab_buf[..slab_count]);
+                // Reclaim any unpushed (mathematically guaranteed to fit via available(), belt-and-suspenders)
+                for i in pushed..slab_count {
+                    ctx.slab.free(slab_buf[i]);
+                }
+            }
+        }
+    }
+
+    // R-02 SPSC PATH: Pop pre-built TUN frames from the housekeeping thread
+    if let Some(ref mut cons) = ctx.rx_tun_cons {
+        let available = output.capacity() - output.len;
+        if available == 0 { return 0; }
+        let mut desc_buf = [PacketDesc::EMPTY; VECTOR_SIZE];
+        let popped = cons.pop_batch(&mut desc_buf[..available]);
+        for i in 0..popped {
+            output.push(desc_buf[i]);
+        }
+        return popped;
+    }
+
+    // FALLBACK: Direct VFS read (no SPSC ring)
     let mut count = 0;
 
     while !output.is_full() {

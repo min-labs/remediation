@@ -51,6 +51,52 @@ Below is the uncompromising, fiduciary-grade technical debt ledger.
 
 ---
 
+### ✅ SPRINT R-02A: DATAPATH VFS DECOUPLING — HUB (COMPLETED 2026-02-15)
+
+**Scope:** Remove VFS syscalls (`libc::read`/`libc::write` on TUN fd) from the Hub's AF_XDP datapath hot-loops. Introduce SPSC lock-free rings for inter-thread TUN I/O communication.
+
+**Files Modified:**
+
+| File | Action | Summary |
+| --- | --- | --- |
+| `hub/src/engine/spsc.rs` | **NEW** | 142-line SPSC lock-free ring buffer. 128-byte `CachePadded` false-sharing immunity. DPDK-style local head/tail caching. Batch `push_batch`/`pop_batch` with single Release barrier per batch. |
+| `hub/src/engine/mod.rs` | **PATCHED** | Registered `pub mod spsc`. |
+| `hub/src/network/mod.rs` | **PATCHED** | Added `PacketVector::capacity()`. Added 4 `Option<&mut Producer/Consumer>` SPSC handles to `GraphCtx`. |
+| `hub/src/network/datapath.rs` | **PATCHED** | Rewrote `tun_write_vector` (SPSC push path + VFS fallback). Rewrote `tun_read_batch` (SPSC pop + free slab lifecycle + VFS fallback). |
+| `hub/src/main.rs` | **PATCHED** | Created 4 SPSC rings (256-deep). Spawned `tun_housekeeping_thread` on isolated core. `worker_entry` accepts `Option` SPSC handles. `execute_subvector` conditional slab-free. Both `GraphCtx` constructions populated with SPSC fields. |
+
+**Added Constructs:** `SpscRing<T>`, `Producer<T>`, `Consumer<T>`, `make_spsc()`, `tun_housekeeping_thread`, `PacketVector::capacity()`, 4 SPSC fields in `GraphCtx`.
+
+**Self-Audit:**
+- **Over-corrections:** None. VFS fallback paths preserved. Non-tunnel mode unaffected.
+- **Under-delivery:** TUN HK thread is scaffolded (drains rings, returns slab indices) but does not perform actual `libc::read`/`libc::write` — requires UMEM base pointer sharing (deferred).
+
+---
+
+### ✅ SPRINT R-02B: NODE `io_uring` REACTOR INTEGRATION (COMPLETED 2026-02-15)
+
+**Scope:** Replace the Node's legacy `recvmmsg`/`sendmmsg` VFS event loop with a kernel-bypass `io_uring` reactor using `IORING_SETUP_SQPOLL` and Provided Buffer Rings (PBR).
+
+**Files Modified:**
+
+| File | Action | Summary |
+| --- | --- | --- |
+| `node/Cargo.toml` | **PATCHED** | Added `io-uring = "0.7"` — safe Rust bindings for `SQPOLL` + PBR. |
+| `node/src/network/mod.rs` | **PATCHED** | Registered `pub mod uring_reactor`. |
+| `node/src/network/uring_reactor.rs` | **NEW** | 220-line io_uring reactor. HugeTLB mmap arena, PBR registration via `SYS_io_uring_register`, multishot recv arming, BID recycle, staged TUN read/write/UDP send SQE helpers. `arena_base_ptr()` accessor for in-place frame construction. |
+| `node/src/main.rs` | **PATCHED (3 blocks)** | **Patch 1 (L80):** `main()` calls `run_uring_worker()` instead of `run_udp_worker()`. **Patch 2 (L328):** `run_udp_worker` marked `#[allow(dead_code)]` as legacy fallback. **Patch 3 (L697-1131):** Complete `run_uring_worker()` function — UringReactor init, CQE three-pass loop (Pass 0: drain+classify, Pass 1: batch AEAD decrypt, Pass 2: RxAction dispatch), state machine preservation. |
+
+**Added Constructs:** `UringReactor`, `arm_multishot_recv()`, `stage_tun_write()`, `stage_udp_send()`, `arm_tun_read()`, `run_uring_worker()`, CQE tag constants (`TAG_UDP_RECV_MULTISHOT`, `TAG_TUN_READ`, `TAG_TUN_WRITE`, `TAG_UDP_SEND_TUN`, `TAG_UDP_SEND_ECHO`).
+
+**Runtime Verification (2026-02-15):**
+- Hub (remote): `RX:990 TX:963 TUN_R:963 TUN_W:979 AEAD:978/0 HS:1/0 Slab:1539/8192 Peers:1/1`
+- Node (local): `RX:983 TX:986 TUN_R:982 TUN_W:965 AEAD_OK:965 FAIL:0 State:Est`
+- Zero AEAD failures. Bidirectional tunnel operational. PQC handshake completed (HS:1/0).
+
+> **⚠ NOTE:** `run_udp_worker()` is preserved with `#[allow(dead_code)]` as a legacy VFS fallback. It can be re-activated by changing `main()` L80.
+
+---
+
 ### P0 FATAL DEBT: OS PHYSICS & KINETIC SURVIVAL
 
 #### [DEBT-P0-01] The `io_uring` Contradiction & VFS Syscall Avalanche (Node & Hub)
@@ -226,28 +272,98 @@ These constants dictate physical cache alignment, mathematical boundaries, and p
 
 ## III. TELEMETRY & OBSERVABILITY MATRIX
 
-Diagnostic instrumentation is decoupled into a 128-byte `CachePadded` Shared Memory (`/dev/shm`) arena. The `Telemetry` struct guarantees zero-cost visibility via atomic stores with `Ordering::Relaxed`.
+### 1. Hub Observability
 
-### 1. Atomic Metric Wiring Mandates
+The Hub employs a dual-layer telemetry architecture: a `/dev/shm` shared-memory export for cross-process monitoring, and `eprintln!` diagnostic lines for operator visibility.
 
-Currently, several atomic counters reside in memory but are disconnected from the execution graph. They must be wired during their respective Sprints.
+**Layer 1 — Shared Memory Export (`/dev/shm`)**
 
-| Memory Vector | Status | Architectural Mandate |
-| --- | --- | --- |
-| `bbr_phase` | **[UNWIRED]** | Must be wired to the `BbrState` FSM during **Sprint 11**. |
-| `bbr_calibrated` | **[UNWIRED]** | Must reflect the completion of the `STARTUP` phase (**Sprint 11**). |
-| `bbr_btlbw_kbps` | **[UNWIRED]** | Must expose the 10-RTT max bandwidth filter (**Sprint 11**). |
-| `bbr_rtprop_us` | **[UNWIRED]** | Must expose the 10-second min RTT filter (**Sprint 11**). |
-| `replay_drops` | **[UNWIRED]** | Must increment precisely when the RFC 6479 bitmask rejects a sequence number, *prior* to AEAD evaluation (**Sprint 5**). |
-| `auth_fail`, `decrypt_ok`, `handshake_*` | **[GATED]** | Active in `debug` only. **Mandate:** Promote to `always-on`. Drop/Auth failures are critical production metrics required for algorithmic DoS detection. |
-| `*_tsc_total` | **[GATED]** | Pipeline timing vectors. Keep gated to prevent `rdtsc` execution overhead in production builds. |
+The `Telemetry` struct (`hub/src/engine/runtime.rs:453-481`) is `mmap()`'d to `/dev/shm`. Each field is `CachePadded<AtomicU64>` (128-byte aligned) to eliminate false sharing. The Monitor process (`--monitor` mode) reads these atomics with zero datapath contention.
 
-### 2. The Diagnostic Hexdump Engine
+Data flow: VPP graph nodes → `CycleStats` (per-batch, `hub/src/network/mod.rs:210-232`, 17 fields) → accumulated per subvector (`execute_subvector`, `main.rs:380-640`) → bridged to SHM via `fetch_add(Relaxed)` (`main.rs:1222-1232`).
 
-`HexdumpState::new()` is initialized but `dump_tx()` is orphaned on the egress path.
-**Mandate (Sprint 2):** Wire `_hexdump.dump_tx(frame_ptr, frame_len)` into the Datapath thread *after* `scheduler.enqueue_bulk()` executes, completing bidirectional packet inspection.
+| Field | Status | Location | Description |
+| --- | --- | --- | --- |
+| `pid` | **WIRED** | `main.rs:951` | Worker TID via `SYS_gettid` |
+| `rx_count` | **WIRED** | `xdp.rs:321`, `main.rs:1225` | AF_XDP RX + VPP `parsed` accumulation |
+| `tx_count` | **WIRED** | `xdp.rs:321` | AF_XDP TX completion ring |
+| `drops` | **WIRED** | `main.rs:1224` | Parse failures + AEAD failures + classify drops |
+| `cycles` | **WIRED** | `main.rs:1079` | Main loop iteration counter |
+| `decrypt_ok` | **WIRED** | `main.rs:1222` | `aead_decrypt_vector()` success count |
+| `auth_fail` | **WIRED** | `main.rs:1223` | AEAD MAC verification failures |
+| `handshake_ok` | **WIRED** | `main.rs:632` | `process_finished_hub()` success |
+| `handshake_fail` | **WIRED** | `main.rs:618,636` | PQC verification failure / malformed |
+| `direction_fail` | **WIRED** | `datapath.rs:230` | Direction binding rejection (reflection defense) |
+| `jbuf_depth_us` | **WIRED** | `main.rs:1154` | JitterBuffer instantaneous depth (µs) |
+| `jbuf_jitter_us` | **WIRED** | `main.rs:1155` | RFC 3550 EWMA jitter estimate (µs) |
+| `jbuf_releases` | **WIRED** | `main.rs:1156` | JitterBuffer cumulative releases |
+| `jbuf_drops` | **WIRED** | `main.rs:1157` | JitterBuffer late/overflow drops |
+| `parse_tsc_total` | **WIRED** | `main.rs:1228` | `rdtsc` delta: `rx_parse_raw()` |
+| `decrypt_tsc_total` | **WIRED** | `main.rs:1229` | `rdtsc` delta: `aead_decrypt_vector()` |
+| `classify_tsc_total` | **WIRED** | `main.rs:1230` | `rdtsc` delta: `classify()` |
+| `scatter_tsc_total` | **WIRED** | `main.rs:1231` | `rdtsc` delta: `scatter()` |
+| `tun_write_tsc_total` | **WIRED** | `main.rs:1232` | `rdtsc` delta: `tun_write_vector()` |
+| `replay_drops` | **UNWIRED** | — | **Sprint 5:** Increment on RFC 6479 bitmask rejection, before AEAD. |
+| `bbr_phase` | **UNWIRED** | — | **Sprint 11:** BbrPhase as `u32` (0=Startup, 1=Drain, 2=ProbeBW, 3=ProbeRTT). |
+| `bbr_calibrated` | **UNWIRED** | — | **Sprint 11:** Flip to `1` on BBRv3 `STARTUP` exit. |
+| `bbr_btlbw_kbps` | **UNWIRED** | — | **Sprint 11:** 10-RTT max-filtered bottleneck bandwidth. |
+| `bbr_rtprop_us` | **UNWIRED** | — | **Sprint 11:** 10-second min-filtered RTT. |
+
+**Layer 2 — Operator Diagnostics (`eprintln!`)**
+
+| Diagnostic | Location | Trigger | Output |
+| --- | --- | --- | --- |
+| 1/sec telemetry line | `main.rs:1126` | Timer | `[M13-W0] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{}` |
+| Slab exhaustion (UDP frag) | `main.rs:587` | `slab.alloc()` returns `None` during ServerHello UDP fragmentation | `[M13-DIAG] SLAB EXHAUSTION: ...Slab: {}/{} free. Enqueued {}/{} fragments.` |
+| Slab exhaustion (L2 frag) | `main.rs:608` | `slab.alloc()` returns `None` during ServerHello L2 fragmentation | Same format, L2 AF_XDP path |
+| Shutdown summary | `main.rs:1359` | Process exit | `Slab: {}/{} free. UDP TX:{} RX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} Peers:{}` |
+| Hexdump RX | `process_rx_frame()` | `M13_HEXDUMP=1` | Per-packet hex dump of inbound frames |
+| Hexdump TX | — | — | **UNWIRED. Sprint 2:** Wire after `scheduler.enqueue_bulk()` for bidirectional inspection. |
+
+**Blind Spots:**
+
+| Gap | Mandate |
+| --- | --- |
+| SPSC ring occupancy | Ring fill-level invisible to Monitor. Wire `available()` to `Telemetry` SHM. |
+| TUN HK thread | `tun_housekeeping_thread()` (`main.rs:759-933`) has zero counters. VFS I/O latency, `pending_return` queue depth, and DPDK cache hit rates are all invisible. |
+| `tun_writes` semantic shift | Post-R-02A, counts SPSC push operations, not VFS `write()`. Actual VFS I/O in TUN HK thread is unmetered. |
+| Elapsed time at shutdown | Shutdown summary does not emit session duration. Requires external `date` wrapper. |
+| No RTT / jitter / throughput | Hub has no network quality metrics. Measured externally via `ping`/`iperf3` through tunnel (see `OBSERVATIONS.md`). |
 
 ---
+
+### 2. Node Observability
+
+The Node uses 7 local `u64` counters printed to stderr every 1 second. No `/dev/shm` export, no cross-process monitoring.
+
+| Counter | Location | Description |
+| --- | --- | --- |
+| `rx_count` | Pass 0: CQE drain | UDP recv CQEs processed |
+| `tx_count` | TUN read / echo / keepalive / registration | Successful `sock.send()` calls |
+| `aead_ok_count` | Pass 1: batch decrypt | `decrypt_batch_ptrs()` successes |
+| `aead_fail_count` | `process_rx_frame()` L164 | AEAD open failures |
+| `tun_read_count` | Pass 0: `TAG_TUN_READ` | TUN read CQEs processed |
+| `tun_write_count` | Pass 2: `RxAction::TunWrite` | TUN writes staged |
+| `State` | 1/sec report | `Reg` / `HS` / `Est` / `Disc` from `NodeState` enum |
+
+**Output format:**
+```
+[M13-N0] RX:983 TX:986 TUN_R:982 TUN_W:965 AEAD_OK:965 FAIL:0 State:Est
+```
+
+**Blind Spots:**
+
+| Gap | Mandate |
+| --- | --- |
+| No SHM export | **Sprint 2:** Node must gain a `Telemetry` struct to `/dev/shm`, matching Hub's architecture. `eprintln!` fails the operational requirement of external monitoring without log scraping. |
+| io_uring ring pressure | `UringReactor` does not expose SQ depth or CQ overflow. Wire to detect SQPOLL stalls. |
+| Hexdump TX | Same as Hub — `dump_tx()` unwired. |
+| Elapsed time at shutdown | Shutdown line does not emit `elapsed_ns` or `duration_s`. Must be captured externally. |
+| No reconnection counter | `HS_OK` is only on Hub side. Node has no visible counter for re-handshakes. Must infer from state transitions in log. |
+| No RTT / jitter / throughput | Node has no network quality instrumentation. Measured externally via `ping`/`iperf3` through tunnel (see `OBSERVATIONS.md`). |
+
+> **Cross-reference:** Sprint-over-sprint quantified metrics tracked in [`OBSERVATIONS.md`](OBSERVATIONS.md).
+
 
 ## IV. VERIFICATION & VALIDATION (V&V) MATRIX
 

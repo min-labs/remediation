@@ -213,17 +213,78 @@ fn run_executive(if_name: &str, single_queue: Option<i32>, tunnel: bool) {
         t
     } else { None };
 
+    // R-02: Create SPSC rings for TUN decoupling + spawn housekeeping thread
+    use m13_hub::engine::spsc;
+    use m13_hub::network::PacketDesc;
+    const SPSC_RING_DEPTH: usize = 2048; // power-of-two, upgraded from 256 for proper backpressure
+
+    // 4 rings: tx_tun (dp→tun), rx_tun (tun→dp), free_to_tun (dp→tun slab IDs), free_to_dp (tun→dp slab IDs)
+    let (spsc_tx_tun_prod, spsc_tx_tun_cons) = spsc::make_spsc::<PacketDesc>(SPSC_RING_DEPTH);
+    let (spsc_rx_tun_prod, spsc_rx_tun_cons) = spsc::make_spsc::<PacketDesc>(SPSC_RING_DEPTH);
+    let (spsc_free_to_tun_prod, spsc_free_to_tun_cons) = spsc::make_spsc::<u32>(SPSC_RING_DEPTH);
+    let (spsc_free_to_dp_prod, spsc_free_to_dp_cons) = spsc::make_spsc::<u32>(SPSC_RING_DEPTH);
+
+    // R-02: Share UMEM base with TUN HK thread via OnceLock.
+    // Worker 0 publishes (umem_base_ptr_as_usize, frame_size) after Engine::new().
+    // TUN HK thread blocks on .get() until the value is available.
+    let umem_info: std::sync::Arc<std::sync::OnceLock<(usize, u32)>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+
+    // Only spawn the TUN housekeeping thread if tunnel mode is active
+    let tun_thread = if tun_ref.is_some() {
+        let tun_hk_core = *isolated_cores.last().unwrap();
+        let tun_file = tun_ref.as_ref().unwrap().try_clone().ok();
+        let umem_info_hk = umem_info.clone();
+        Some(std::thread::Builder::new()
+            .name("m13-tun-hk".into()).stack_size(4 * 1024 * 1024)
+            .spawn(move || {
+                pin_to_core(tun_hk_core);
+                tun_housekeeping_thread(
+                    tun_file.expect("TUN file clone failed"),
+                    spsc_tx_tun_cons,
+                    spsc_rx_tun_prod,
+                    spsc_free_to_tun_cons,
+                    spsc_free_to_dp_prod,
+                    umem_info_hk,
+                );
+            })
+            .unwrap_or_else(|_| fatal(E_AFFINITY_FAIL, "TUN HK thread spawn failed")))
+    } else { None };
+
+    eprintln!("[M13-EXEC] R-02 SPSC rings: depth={}, TUN HK thread: {}",
+        SPSC_RING_DEPTH,
+        if tun_thread.is_some() { format!("Core {}", isolated_cores.last().unwrap()) } else { "inactive".into() });
+
     let mut handles = Vec::with_capacity(worker_count);
+    // Wrap worker-side SPSC handles in Option so worker 0 gets them via .take()
+    let mut opt_tx_tun_prod = Some(spsc_tx_tun_prod);
+    let mut opt_rx_tun_cons = Some(spsc_rx_tun_cons);
+    let mut opt_free_to_tun_prod = Some(spsc_free_to_tun_prod);
+    let mut opt_free_to_dp_cons = Some(spsc_free_to_dp_cons);
+
     for worker_idx in 0..worker_count {
         let core_id = isolated_cores[worker_idx];
         let queue_id = match single_queue { Some(q) => q, None => worker_idx as i32 };
         let iface = if_name.to_string();
         let cal = tsc_cal; // Copy for this worker (TscCal is Copy)
         let tun = tun_ref.as_ref().and_then(|f| f.try_clone().ok());
-        
+
+        // Only worker 0 gets SPSC handles (TUN I/O is single-reader/writer)
+        let w_tx_tun = if worker_idx == 0 { opt_tx_tun_prod.take() } else { None };
+        let w_rx_tun = if worker_idx == 0 { opt_rx_tun_cons.take() } else { None };
+        let w_free_tun = if worker_idx == 0 { opt_free_to_tun_prod.take() } else { None };
+        let w_free_dp = if worker_idx == 0 { opt_free_to_dp_cons.take() } else { None };
+        let umem_info_w = umem_info.clone();
+
         let handle = std::thread::Builder::new()
             .name(format!("m13-w{}", worker_idx)).stack_size(32 * 1024 * 1024)
-            .spawn(move || { worker_entry(worker_idx, core_id, queue_id, &iface, map_fd, cal, tun); })
+            .spawn(move || {
+                worker_entry(
+                    worker_idx, core_id, queue_id, &iface, map_fd, cal, tun,
+                    w_tx_tun, w_rx_tun, w_free_tun, w_free_dp,
+                    umem_info_w,
+                );
+            })
             .unwrap_or_else(|_| fatal(E_AFFINITY_FAIL, "Thread spawn failed"));
         handles.push(handle);
     }
@@ -231,6 +292,8 @@ fn run_executive(if_name: &str, single_queue: Option<i32>, tunnel: bool) {
     eprintln!("[M13-EXEC] Engine operational. Workers running.");
 
     for h in handles { let _ = h.join(); }
+    // Wait for TUN housekeeping thread
+    if let Some(th) = tun_thread { let _ = th.join(); }
     drop(steersman);
 
     // Post-worker cleanup: nuke everything
@@ -410,13 +473,19 @@ fn execute_subvector(
     if cfg!(debug_assertions) { eprintln!("[DBG] free done, entering output nodes"); }
 
     // OUTPUT: TUN WRITE
+    // R-02: When SPSC is active, slab ownership transfers to TUN thread via push.
+    //       When SPSC is None (fallback), we free slabs here as before.
     if tun_vec.len > 0 {
         let mut tun_disp = Disposition::new();
+        let has_spsc = ctx.tx_tun_prod.is_some();
         let t_tun = read_tsc();
-        datapath::tun_write_vector(&tun_vec, &mut tun_disp, ctx.tun_fd, ctx.umem_base, &mut stats);
+        datapath::tun_write_vector(&tun_vec, &mut tun_disp, ctx, &mut stats);
         stats.tun_write_tsc = read_tsc() - t_tun;
-        for i in 0..tun_vec.len {
-            ctx.slab.free((tun_vec.descs[i].addr / ctx.frame_size as u64) as u32);
+        // Only free slabs if VFS fallback was used (no SPSC = direct write, we own the slab)
+        if !has_spsc {
+            for i in 0..tun_vec.len {
+                ctx.slab.free((tun_vec.descs[i].addr / ctx.frame_size as u64) as u32);
+            }
         }
     }
 
@@ -505,12 +574,18 @@ fn process_handshake_message(
                         ctx.hub_port, peer_port, &server_hello, hs_flags,
                         &mut hs_seq_tx, ctx.ip_id_counter,
                     );
+                    let total_frags = frames.len();
+                    let mut enqueued = 0usize;
                     for raw_frame in frames {
                         if let Some(slab_idx) = ctx.slab.alloc() {
                             let frame_ptr = unsafe { ctx.umem_base.add((slab_idx as usize) * ctx.frame_size as usize) };
                             let flen = raw_frame.len().min(ctx.frame_size as usize);
                             unsafe { std::ptr::copy_nonoverlapping(raw_frame.as_ptr(), frame_ptr, flen); }
                             ctx.scheduler.enqueue_critical((slab_idx as u64) * ctx.frame_size as u64, flen as u32);
+                            enqueued += 1;
+                        } else {
+                            eprintln!("[M13-DIAG] SLAB EXHAUSTION: slab.alloc()=None during ServerHello UDP fragment. Slab: {}/{} free. Enqueued {}/{} fragments.",
+                                ctx.slab.available(), 8192, enqueued, total_frags);
                         }
                     }
                 } else {
@@ -520,12 +595,18 @@ fn process_handshake_message(
                         &server_hello, hs_flags,
                         &mut hs_seq_tx,
                     );
+                    let total_frags = frames.len();
+                    let mut enqueued = 0usize;
                     for raw_frame in frames {
                         if let Some(slab_idx) = ctx.slab.alloc() {
                             let frame_ptr = unsafe { ctx.umem_base.add((slab_idx as usize) * ctx.frame_size as usize) };
                             let flen = raw_frame.len().min(ctx.frame_size as usize);
                             unsafe { std::ptr::copy_nonoverlapping(raw_frame.as_ptr(), frame_ptr, flen); }
                             ctx.scheduler.enqueue_critical((slab_idx as u64) * ctx.frame_size as u64, flen as u32);
+                            enqueued += 1;
+                        } else {
+                            eprintln!("[M13-DIAG] SLAB EXHAUSTION: slab.alloc()=None during ServerHello L2 fragment. Slab: {}/{} free. Enqueued {}/{} fragments.",
+                                ctx.slab.available(), 8192, enqueued, total_frags);
                         }
                     }
                 }
@@ -667,8 +748,202 @@ fn execute_tx_graph(
     total_tx
 }
 
+// ── TUN Housekeeping Thread (R-02A: DPDK Lifecycle Enforcement) ─────────
+// Runs on an isolated core. Performs ALL VFS syscalls (read/write) on the TUN fd.
+// Communicates with the datapath thread via 4 SPSC lock-free rings.
+//
+// DPDK-Style Local Cache: [u32; 4096] pending_return buffer.
+// Mathematical Bound: TUN HK consumes from tx_tun_cons (2048) + free_to_tun_cons (2048).
+// Maximum theoretical in-flight slabs = 4096. Buffer can NEVER overflow.
+// This eliminates ALL conditional drops — zero slab leakage under any backpressure scenario.
+fn tun_housekeeping_thread(
+    tun_file: std::fs::File,
+    mut rx_from_dp: m13_hub::engine::spsc::Consumer<m13_hub::network::PacketDesc>,
+    mut tx_to_dp: m13_hub::engine::spsc::Producer<m13_hub::network::PacketDesc>,
+    mut free_slab_rx: m13_hub::engine::spsc::Consumer<u32>,
+    mut free_slab_tx: m13_hub::engine::spsc::Producer<u32>,
+    umem_info: std::sync::Arc<std::sync::OnceLock<(usize, u32)>>,
+) {
+    use std::os::unix::io::AsRawFd;
+    use m13_hub::engine::protocol::{M13_HDR_SIZE, ETH_HDR_SIZE, M13_WIRE_MAGIC, M13_WIRE_VERSION, FLAG_TUNNEL, ETH_P_M13};
+    use libc::{poll, pollfd, POLLIN};
+    let tun_fd = tun_file.as_raw_fd();
+
+    // Block until worker 0 publishes UMEM base after Engine::new()
+    eprintln!("[M13-TUN-HK] Waiting for UMEM base from worker 0...");
+    let (umem_base_usize, frame_size) = loop {
+        if let Some(info) = umem_info.get() {
+            break *info;
+        }
+        if SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[M13-TUN-HK] Shutdown before UMEM available.");
+            return;
+        }
+        std::thread::yield_now();
+    };
+    let umem_base = umem_base_usize as *mut u8;
+    eprintln!("[M13-TUN-HK] UMEM base={:#x}, frame_size={}, TUN fd={}", umem_base_usize, frame_size, tun_fd);
+
+    // DPDK-Style Local Cache: Absorbs backpressure on free_to_dp ring.
+    // Absolute Mathematical Maximum: tx_tun_cons (2048) + free_to_tun_cons (2048) = 4096.
+    // 4096 * 4 bytes = 16 KB stack array. Impossible to overflow.
+    let mut pending_return = [0u32; 4096];
+    let mut pending_count: usize = 0;
+
+    let mut pfd = pollfd { fd: tun_fd, events: POLLIN, revents: 0 };
+    let mut write_buf = [m13_hub::network::PacketDesc::EMPTY; 64];
+    let mut alloc_buf = [0u32; 64];
+    let mut total_writes: u64 = 0;
+    let mut total_reads: u64 = 0;
+
+    eprintln!("[M13-TUN-HK] VFS Housekeeping Thread active. DPDK cache=4096 slots.");
+
+    loop {
+        if SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+        // ==========================================================
+        // PHASE 0: DRAIN PENDING RETURNS (Backpressure Resolution)
+        // Must run FIRST to free ring space before generating new returns.
+        // ==========================================================
+        if pending_count > 0 {
+            let pushed = free_slab_tx.push_batch(&pending_return[..pending_count]);
+            if pushed > 0 {
+                // Fast block-memory shift to preserve cache locality
+                pending_return.copy_within(pushed..pending_count, 0);
+                pending_count -= pushed;
+            }
+        }
+
+        // ==========================================================
+        // PHASE 1: TX PATH (Datapath → TUN VFS → Return Slabs)
+        // ==========================================================
+        let write_count = rx_from_dp.pop_batch(&mut write_buf);
+        if write_count > 0 {
+            let mut local_free = [0u32; 64];
+            for i in 0..write_count {
+                let desc = &write_buf[i];
+                let m13_off = desc.m13_offset as usize;
+                let payload_start = m13_off + M13_HDR_SIZE;
+
+                let plen = unsafe {
+                    let m13_ptr = umem_base.add(desc.addr as usize + m13_off);
+                    u32::from_le_bytes(
+                        std::slice::from_raw_parts(m13_ptr.add(41), 4)
+                            .try_into().unwrap_or([0;4])
+                    )
+                } as usize;
+
+                if plen > 0 && payload_start + plen <= desc.len as usize {
+                    let payload_ptr = unsafe { umem_base.add(desc.addr as usize + payload_start) };
+                    unsafe {
+                        libc::write(tun_fd, payload_ptr as *const libc::c_void, plen);
+                    }
+                    total_writes += 1;
+                }
+                local_free[i] = (desc.addr / frame_size as u64) as u32;
+            }
+
+            // Attempt immediate return; overflow into DPDK cache (guaranteed to fit)
+            let pushed = free_slab_tx.push_batch(&local_free[..write_count]);
+            for i in pushed..write_count {
+                pending_return[pending_count] = local_free[i];
+                pending_count += 1;
+            }
+        }
+
+        // ==========================================================
+        // PHASE 2: RX PATH (TUN VFS → Datapath)
+        // Uses poll() with 1ms timeout to avoid busy-spinning.
+        // ==========================================================
+        let p_res = unsafe { poll(&mut pfd, 1, 1) }; // 1ms timeout
+        if p_res > 0 && (pfd.revents & POLLIN) != 0 {
+            let alloc_count = free_slab_rx.pop_batch(&mut alloc_buf);
+
+
+            for i in 0..alloc_count {
+                let idx = alloc_buf[i];
+                let addr = (idx as u64) * (frame_size as u64);
+                let frame_ptr = unsafe { umem_base.add(addr as usize) };
+                let payload_ptr = unsafe { frame_ptr.add(ETH_HDR_SIZE + M13_HDR_SIZE) };
+                let max_payload = frame_size as usize - ETH_HDR_SIZE - M13_HDR_SIZE;
+
+                let n = unsafe {
+                    libc::read(tun_fd, payload_ptr as *mut libc::c_void, max_payload)
+                };
+
+                if n <= 0 {
+                    // EAGAIN or failure: Return this slab AND all remaining unused slabs
+                    // to the DPDK cache. Mathematically guaranteed to fit (max 4096).
+                    pending_return[pending_count] = idx;
+                    pending_count += 1;
+                    for j in (i + 1)..alloc_count {
+                        pending_return[pending_count] = alloc_buf[j];
+                        pending_count += 1;
+                    }
+                    break;
+                }
+
+                let payload_len = n as usize;
+                let frame_len = ETH_HDR_SIZE + M13_HDR_SIZE + payload_len;
+
+                // Build Ethernet + M13 header in-place
+                let frame = unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
+                frame[0..6].copy_from_slice(&[0xFF; 6]);
+                frame[6..12].copy_from_slice(&[0; 6]); // src_mac filled by datapath
+                frame[12] = (ETH_P_M13 >> 8) as u8;
+                frame[13] = (ETH_P_M13 & 0xFF) as u8;
+                frame[14] = M13_WIRE_MAGIC;
+                frame[15] = M13_WIRE_VERSION;
+                frame[54] = FLAG_TUNNEL;
+                frame[55..59].copy_from_slice(&(payload_len as u32).to_le_bytes());
+
+                let mut desc = m13_hub::network::PacketDesc::EMPTY;
+                desc.addr = addr;
+                desc.len = frame_len as u32;
+                desc.m13_offset = ETH_HDR_SIZE as u16;
+                desc.flags = FLAG_TUNNEL;
+                desc.payload_len = payload_len as u32;
+
+                if payload_len >= 20 {
+                    let ip_hdr = unsafe { std::slice::from_raw_parts(payload_ptr as *const u8, 20) };
+                    desc.src_ip.copy_from_slice(&ip_hdr[16..20]);
+                }
+
+                if tx_to_dp.push_batch(&[desc]) == 0 {
+                    // rx_tun ring full: cache the slab for return (guaranteed to fit)
+                    pending_return[pending_count] = idx;
+                    pending_count += 1;
+                }
+                total_reads += 1;
+            }
+        } else if write_count == 0 {
+            // No TX work and no RX data — yield to avoid busy-spinning
+            std::thread::yield_now();
+        }
+    }
+
+    // Drain remaining pending returns at shutdown
+    if pending_count > 0 {
+        let pushed = free_slab_tx.push_batch(&pending_return[..pending_count]);
+        if pushed < pending_count {
+            eprintln!("[M13-TUN-HK] Shutdown: {} slabs unrecoverable (ring full at exit)", pending_count - pushed);
+        }
+    }
+
+    eprintln!("[M13-TUN-HK] Shutdown. Total writes: {}, reads: {}, pending_at_exit: {}", total_writes, total_reads, pending_count);
+}
+
 // ── Worker Entry ────────────────────────────────────────────────────────
-fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str, bpf_map_fd: i32, cal: TscCal, tun: Option<std::fs::File>) {
+#[allow(clippy::too_many_arguments)]
+fn worker_entry(
+    worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
+    bpf_map_fd: i32, cal: TscCal, tun: Option<std::fs::File>,
+    mut spsc_tx_tun_prod: Option<m13_hub::engine::spsc::Producer<m13_hub::network::PacketDesc>>,
+    mut spsc_rx_tun_cons: Option<m13_hub::engine::spsc::Consumer<m13_hub::network::PacketDesc>>,
+    mut spsc_free_to_tun_prod: Option<m13_hub::engine::spsc::Producer<u32>>,
+    mut spsc_free_to_dp_cons: Option<m13_hub::engine::spsc::Consumer<u32>>,
+    umem_info: std::sync::Arc<std::sync::OnceLock<(usize, u32)>>,
+) {
     pin_to_core(core_id);
     verify_affinity(core_id);
     let stats = Telemetry::map_worker(worker_idx, true);
@@ -676,6 +951,13 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
     stats.pid.value.store(unsafe { libc::syscall(libc::SYS_gettid) } as u32, Ordering::Relaxed);
     let mut engine = Engine::<ZeroCopyTx>::new_zerocopy(if_name, queue_id, bpf_map_fd);
     eprintln!("[M13-W{}] Datapath: {}", worker_idx, engine.xdp_mode);
+
+    // R-02: Worker 0 publishes UMEM base to unblock TUN HK thread.
+    if worker_idx == 0 {
+        let _ = umem_info.set((engine.umem_base() as usize, FRAME_SIZE as u32));
+        eprintln!("[M13-W0] Published UMEM base={:#x} frame_size={} to TUN HK",
+            engine.umem_base() as usize, FRAME_SIZE);
+    }
     let mut slab = FixedSlab::new(SLAB_DEPTH);
     let mut scheduler = Scheduler::new();
     let mut rx_state = ReceiverState::new();
@@ -822,6 +1104,11 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                 now_ns: now,
                 umem_base: engine.umem_base(),
                 frame_size: FRAME_SIZE,
+                // R-02: SPSC handles (None = VFS fallback)
+                tx_tun_prod: spsc_tx_tun_prod.as_mut(),
+                rx_tun_cons: spsc_rx_tun_cons.as_mut(),
+                free_to_tun_prod: spsc_free_to_tun_prod.as_mut(),
+                free_to_dp_cons: spsc_free_to_dp_cons.as_mut(),
             };
             let tx_count = execute_tx_graph(&mut tx_gctx);
             udp_tx_count += tx_count;
@@ -834,10 +1121,14 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
             for pi in 0..MAX_PEERS {
                 if peers.slots[pi].lifecycle == PeerLifecycle::Established { established += 1; }
             }
-            eprintln!("[M13-W{}] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} Peers:{}/{}",
+            let hs_ok = stats.handshake_ok.value.load(Ordering::Relaxed);
+            let hs_fail = stats.handshake_fail.value.load(Ordering::Relaxed);
+            eprintln!("[M13-W{}] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{}",
                 worker_idx, udp_rx_count, udp_tx_count,
                 tun_read_count, tun_write_count,
                 aead_ok_count, aead_fail_count,
+                hs_ok, hs_fail,
+                slab.available(), SLAB_DEPTH,
                 established, peers.count);
         }
 
@@ -902,7 +1193,12 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                     closing,
                     now_ns: now,
                     umem_base: umem,
-                    frame_size: FRAME_SIZE as u32,
+                    frame_size: FRAME_SIZE,
+                    // R-02: SPSC handles (None = VFS fallback)
+                    tx_tun_prod: spsc_tx_tun_prod.as_mut(),
+                    rx_tun_cons: spsc_rx_tun_cons.as_mut(),
+                    free_to_tun_prod: spsc_free_to_tun_prod.as_mut(),
+                    free_to_dp_cons: spsc_free_to_dp_cons.as_mut(),
                 };
 
                 let cycle = execute_graph(

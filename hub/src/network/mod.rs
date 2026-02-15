@@ -14,6 +14,7 @@ use std::fmt;
 use crate::engine::protocol::PeerTable;
 use crate::engine::runtime::FixedSlab;
 use crate::engine::protocol::{Scheduler, ReceiverState, RxBitmap};
+use crate::engine::spsc::{Producer, Consumer};
 
 // ============================================================================
 // PACKET VECTOR — The fundamental VPP data structure
@@ -73,6 +74,9 @@ impl PacketVector {
 
     #[inline(always)]
     pub fn is_full(&self) -> bool { self.len >= VECTOR_SIZE }
+
+    #[inline(always)]
+    pub fn capacity(&self) -> usize { VECTOR_SIZE }
 }
 
 // ============================================================================
@@ -195,6 +199,11 @@ pub struct GraphCtx<'a> {
     pub now_ns: u64,
     pub umem_base: *mut u8,
     pub frame_size: u32,
+    // R-02: SPSC ring handles for decoupled TUN I/O (None if no tunnel)
+    pub tx_tun_prod: Option<&'a mut Producer<PacketDesc>>,
+    pub rx_tun_cons: Option<&'a mut Consumer<PacketDesc>>,
+    pub free_to_tun_prod: Option<&'a mut Producer<u32>>,
+    pub free_to_dp_cons: Option<&'a mut Consumer<u32>>,
 }
 
 #[derive(Default, Clone)]

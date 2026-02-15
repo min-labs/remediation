@@ -77,7 +77,7 @@ fn main() {
         if let Ok(mut g) = HUB_IP_GLOBAL.lock() {
             *g = ip.split(':').next().unwrap_or(&ip).to_string();
         }
-        run_udp_worker(&ip, echo, hexdump, tun_file);
+        run_uring_worker(&ip, echo, hexdump, tun_file);
     } else {
          eprintln!("Usage: m13-node --hub-ip <ip:port> [--echo] [--hexdump] [--tunnel]");
          std::process::exit(1);
@@ -325,6 +325,7 @@ fn tune_system_buffers() {
     }
 }
 
+#[allow(dead_code)] // Legacy recvmmsg/sendmmsg fallback — retained for systems without Kernel 6.12+.
 fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Option<std::fs::File>) {
     let cal = calibrate_tsc();
 
@@ -685,6 +686,391 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
         }
     }
     // Teardown routes on exit
+    if routes_installed {
+        teardown_tunnel_routes(&hub_ip);
+    }
+    eprintln!("[M13-N0] Shutdown. RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{}",
+        rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count);
+}
+
+// ── io_uring SQPOLL Worker (R-02B: Zero-Syscall Datapath) ──────────────
+// Replaces run_udp_worker. Uses UringReactor for ALL network I/O.
+// CQE-driven event loop: multishot recv for UDP RX, staged SQEs for TX.
+// State machine (handshake, keepalive, rekey, route install) is identical.
+fn run_uring_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, tun: Option<std::fs::File>) {
+    use crate::network::uring_reactor::*;
+
+    let cal = calibrate_tsc();
+    tune_system_buffers();
+
+    // UDP socket — connected mode for sendto-free operation
+    let sock = UdpSocket::bind("0.0.0.0:0")
+        .unwrap_or_else(|_| fatal(0x30, "UDP bind failed"));
+    sock.connect(hub_addr)
+        .unwrap_or_else(|_| fatal(0x31, "UDP connect failed"));
+
+    let raw_fd = sock.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+        libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let buf_sz: libc::c_int = 8 * 1024 * 1024;
+        libc::setsockopt(raw_fd, libc::SOL_SOCKET, libc::SO_RCVBUFFORCE,
+            &buf_sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(raw_fd, libc::SOL_SOCKET, libc::SO_SNDBUFFORCE,
+            &buf_sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    }
+
+    let hub_ip = hub_addr.split(':').next().unwrap_or(hub_addr).to_string();
+
+    // Initialize io_uring reactor (SQPOLL on CPU 0)
+    let mut reactor = UringReactor::new(raw_fd, 0);
+    eprintln!("[M13-NODE-URING] io_uring PBR reactor initialized. SQPOLL active.");
+
+    // TUN fd for io_uring ops
+    let tun_fd: i32 = tun.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
+
+    // Arm initial TUN reads using BIDs in [UDP_RING_ENTRIES .. TOTAL_BIDS)
+    if tun_fd >= 0 {
+        for bid in UDP_RING_ENTRIES as u16..(UDP_RING_ENTRIES + TUN_RX_ENTRIES) as u16 {
+            reactor.arm_tun_read(tun_fd, bid);
+        }
+        reactor.submit();
+    }
+
+    let mut seq_tx: u64 = 0;
+    let mut rx_count: u64 = 0;
+    let mut tx_count: u64 = 0;
+    let mut aead_fail_count: u64 = 0;
+    let mut aead_ok_count: u64 = 0;
+    let mut tun_read_count: u64 = 0;
+    let mut tun_write_count: u64 = 0;
+    let mut hexdump = HexdumpState::new(hexdump_mode);
+    let mut assembler = Assembler::new();
+    let mut last_report_ns: u64 = rdtsc_ns(&cal);
+    let mut last_keepalive_ns: u64 = 0;
+    let mut gc_counter: u64 = 0;
+    let mut routes_installed = false;
+    let start_ns = rdtsc_ns(&cal);
+    let src_mac: [u8; 6] = detect_mac(None);
+    let hub_mac: [u8; 6] = [0xFF; 6];
+
+    // Registration frame via legacy send (before main CQE loop)
+    let reg = build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL);
+    seq_tx += 1;
+    if sock.send(&reg).is_ok() { tx_count += 1; }
+    hexdump.dump_tx(&reg, rdtsc_ns(&cal));
+    let mut state = NodeState::Registering;
+
+    // Pre-built M13 header template for TUN TX path
+    let mut hdr_template = [0u8; 62];
+    hdr_template[0..6].copy_from_slice(&hub_mac);
+    hdr_template[6..12].copy_from_slice(&src_mac);
+    hdr_template[12] = (ETH_P_M13 >> 8) as u8;
+    hdr_template[13] = (ETH_P_M13 & 0xFF) as u8;
+    hdr_template[14] = M13_WIRE_MAGIC;
+    hdr_template[15] = M13_WIRE_VERSION;
+
+    eprintln!("[M13-NODE-URING] Connected to {}. Echo={} Hexdump={}", hub_addr, echo, hexdump_mode);
+
+    loop {
+        if SHUTDOWN.load(Ordering::Relaxed) { break; }
+        let now = rdtsc_ns(&cal);
+
+        // Connection timeout
+        if !matches!(state, NodeState::Established { .. })
+            && now.saturating_sub(start_ns) > 30_000_000_000 {
+            eprintln!("[M13-NODE-URING] Connection timed out (30s). Exiting.");
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════
+        // VPP (Vector Packet Processing) — Three-Pass CQE Pipeline
+        // Industry pattern (DPDK, FD.io/VPP, Cloudflare flowtrackd):
+        //   Pass 0: Drain CQEs, classify (recv batch vs non-recv inline)
+        //   Pass 1: Vectorized AEAD batch decrypt (4-at-a-time AES-NI)
+        //   Pass 2: Per-frame process_rx_frame → RxAction dispatch
+        // Never interleave classify → crypto → I/O. Each phase runs
+        // over the full batch, keeping the functional unit thermally hot.
+        // ══════════════════════════════════════════════════════════
+
+        // ── Pass 0: CQE Drain + Classify ───────────────────────
+        reactor.ring.completion().sync();
+        const MAX_CQE: usize = 128;
+        let mut cqe_batch: [(i32, u32, u64); MAX_CQE] = [(0, 0, 0); MAX_CQE];
+        let mut cqe_count = 0usize;
+        for cqe in reactor.ring.completion() {
+            if cqe_count < MAX_CQE {
+                cqe_batch[cqe_count] = (cqe.result(), cqe.flags(), cqe.user_data());
+                cqe_count += 1;
+            }
+        }
+
+        // Separate recv CQEs (batch-processable) from non-recv (handle inline)
+        let mut recv_bids: [u16; MAX_CQE] = [0; MAX_CQE];
+        let mut recv_lens: [usize; MAX_CQE] = [0; MAX_CQE];
+        let mut recv_flags: [u32; MAX_CQE] = [0; MAX_CQE];
+        let mut recv_count: usize = 0;
+        let mut multishot_needs_rearm = false;
+
+        for ci in 0..cqe_count {
+            let (result, flags, user_data) = cqe_batch[ci];
+            let tag = user_data & 0xFFFF_FFFF;
+            let bid_from_ud = ((user_data >> 32) & 0xFFFF) as u16;
+
+            match tag {
+                TAG_UDP_RECV_MULTISHOT => {
+                    if result <= 0 {
+                        reactor.multishot_active = false;
+                        multishot_needs_rearm = true;
+                        continue;
+                    }
+                    let bid = if flags & IORING_CQE_F_BUFFER != 0 {
+                        ((flags >> 16) & 0xFFFF) as u16
+                    } else { continue; };
+
+                    recv_bids[recv_count] = bid;
+                    recv_lens[recv_count] = result as usize;
+                    recv_flags[recv_count] = flags;
+                    recv_count += 1;
+                    rx_count += 1;
+
+                    if flags & IORING_CQE_F_MORE == 0 {
+                        reactor.multishot_active = false;
+                        multishot_needs_rearm = true;
+                    }
+                }
+
+                // Non-recv CQEs: cheap, handle inline
+                TAG_TUN_READ => {
+                    if result <= 0 {
+                        reactor.arm_tun_read(tun_fd, bid_from_ud);
+                        continue;
+                    }
+                    let payload_len = result as usize;
+                    tun_read_count += 1;
+                    let frame_base = unsafe {
+                        reactor.arena_base_ptr().add((bid_from_ud as usize) * FRAME_SIZE)
+                    };
+                    let frame = unsafe {
+                        std::slice::from_raw_parts_mut(frame_base, 62 + payload_len)
+                    };
+                    frame[0..46].copy_from_slice(&hdr_template[0..46]);
+                    frame[46..54].copy_from_slice(&seq_tx.to_le_bytes());
+                    frame[54] = FLAG_TUNNEL;
+                    frame[55..59].copy_from_slice(&(payload_len as u32).to_le_bytes());
+                    frame[59..62].copy_from_slice(&hdr_template[59..62]);
+                    if let NodeState::Established { ref cipher, .. } = state {
+                        seal_frame(frame, cipher, seq_tx, DIR_NODE_TO_HUB);
+                    }
+                    seq_tx += 1;
+                    reactor.stage_udp_send(
+                        frame_base, (62 + payload_len) as u32,
+                        bid_from_ud, TAG_UDP_SEND_TUN,
+                    );
+                    reactor.submit();
+                    tx_count += 1;
+                }
+
+                TAG_TUN_WRITE => {
+                    reactor.add_buffer_to_pbr(bid_from_ud);
+                    reactor.commit_pbr();
+                }
+
+                TAG_UDP_SEND_ECHO | TAG_UDP_SEND_TUN => {
+                    if tag == TAG_UDP_SEND_TUN && tun_fd >= 0 {
+                        reactor.arm_tun_read(tun_fd, bid_from_ud);
+                    }
+                    reactor.submit();
+                }
+
+                _ => {}
+            }
+        }
+
+        // ── Pass 1: Vectorized AEAD Batch Decrypt ──────────────
+        // 4-at-a-time AES-NI/ARMv8-CE prefetch saturates crypto pipeline.
+        // decrypt_one stamps PRE_DECRYPTED_MARKER (0x02) on success —
+        // process_rx_frame recognizes it and skips both decrypt and
+        // cleartext-reject. Failures keep 0x01 → scalar fallback.
+        if recv_count > 0 {
+            if let NodeState::Established { ref cipher, ref mut frame_count, ref established_ns, .. } = state {
+                let mut enc_ptrs: [*mut u8; MAX_CQE] = [std::ptr::null_mut(); MAX_CQE];
+                let mut enc_lens: [usize; MAX_CQE] = [0; MAX_CQE];
+                let mut enc_count: usize = 0;
+
+                for ri in 0..recv_count {
+                    let bid = recv_bids[ri];
+                    let len = recv_lens[ri];
+                    let ptr = unsafe {
+                        reactor.arena_base_ptr().add((bid as usize) * FRAME_SIZE)
+                    };
+                    // Encrypted frame: len >= ETH_HDR + 40, crypto flag == 0x01
+                    if len >= ETH_HDR_SIZE + 40 {
+                        let crypto_flag = unsafe { *ptr.add(ETH_HDR_SIZE + 2) };
+                        if crypto_flag == 0x01 {
+                            enc_ptrs[enc_count] = ptr;
+                            enc_lens[enc_count] = len;
+                            enc_count += 1;
+                        }
+                    }
+                }
+
+                if enc_count > 0 {
+                    let mut decrypt_results = [false; MAX_CQE];
+                    let ok = crate::cryptography::aead::decrypt_batch_ptrs(
+                        &enc_ptrs, &enc_lens, enc_count, cipher, DIR_NODE_TO_HUB,
+                        &mut decrypt_results[..enc_count],
+                    );
+                    *frame_count += ok as u64;
+                    aead_ok_count += ok as u64;
+
+                    // Rekey check after batch
+                    if *frame_count >= REKEY_FRAME_LIMIT
+                       || now.saturating_sub(*established_ns) > REKEY_TIME_LIMIT_NS {
+                        eprintln!("[M13-NODE-PQC] Rekey threshold reached (batch). Re-initiating handshake.");
+                        state = NodeState::Registering;
+                    }
+                }
+            }
+        }
+
+        // ── Pass 2: Per-Frame RxAction Dispatch ────────────────
+        // Frames with PRE_DECRYPTED_MARKER skip decrypt entirely.
+        for ri in 0..recv_count {
+            let bid = recv_bids[ri];
+            let pkt_len = recv_lens[ri];
+
+            let mut frame = reactor.get_frame(bid, pkt_len);
+            let buf = frame.as_mut();
+
+            hexdump.dump_rx(buf, now);
+
+            if matches!(state, NodeState::Disconnected) {
+                state = NodeState::Registering;
+            }
+
+            let action = process_rx_frame(buf, &mut state, &mut assembler,
+                &mut hexdump, now, echo, &mut aead_fail_count);
+
+            let mut bid_deferred = false;
+            match action {
+                RxAction::NeedHandshakeInit => {
+                    state = initiate_handshake(
+                        &sock, &src_mac, &hub_mac, &mut seq_tx, &mut hexdump, &cal,
+                    );
+                }
+                RxAction::TunWrite { start, plen } => {
+                    if tun_fd >= 0 {
+                        let write_ptr = unsafe {
+                            reactor.arena_base_ptr().add((bid as usize) * FRAME_SIZE + start)
+                        };
+                        reactor.stage_tun_write(tun_fd, write_ptr, plen as u32, bid);
+                        reactor.submit();
+                        tun_write_count += 1;
+                        bid_deferred = true;
+                    }
+                }
+                RxAction::Echo => {
+                    if let Some(mut echo_frame) = build_echo_frame(buf, seq_tx) {
+                        if let NodeState::Established { ref cipher, ref session_key, .. } = state {
+                            if *session_key != [0u8; 32] {
+                                seal_frame(&mut echo_frame, cipher, seq_tx, DIR_NODE_TO_HUB);
+                            }
+                        }
+                        seq_tx += 1;
+                        hexdump.dump_tx(&echo_frame, now);
+                        if sock.send(&echo_frame).is_ok() { tx_count += 1; }
+                    }
+                }
+                RxAction::HandshakeComplete { session_key, finished_payload } => {
+                    let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
+                    let frags = send_fragmented_udp(
+                        &sock, &src_mac, &hub_mac,
+                        &finished_payload, hs_flags,
+                        &mut seq_tx, &mut hexdump, &cal,
+                    );
+                    if cfg!(debug_assertions) {
+                        eprintln!("[M13-NODE-PQC] Finished sent: {}B, {} fragments",
+                            finished_payload.len(), frags);
+                    }
+                    state = NodeState::Established {
+                        session_key,
+                        cipher: Box::new(aead::LessSafeKey::new(
+                            aead::UnboundKey::new(&aead::AES_256_GCM, &session_key).unwrap()
+                        )),
+                        frame_count: 0,
+                        established_ns: now,
+                    };
+                    if cfg!(debug_assertions) { eprintln!("[M13-NODE-PQC] → Established"); }
+                    if tun.is_some() && !routes_installed {
+                        setup_tunnel_routes(&hub_ip);
+                        routes_installed = true;
+                    }
+                }
+                RxAction::HandshakeFailed => {
+                    eprintln!("[M13-NODE-PQC] Handshake failed → Disconnected");
+                    state = NodeState::Disconnected;
+                }
+                RxAction::RekeyNeeded => {
+                    state = NodeState::Registering;
+                }
+                RxAction::Drop => {}
+            }
+
+            if !bid_deferred {
+                reactor.add_buffer_to_pbr(bid);
+                reactor.commit_pbr();
+            }
+        }
+
+        // Re-arm multishot recv if terminated during this batch
+        if multishot_needs_rearm {
+            reactor.arm_multishot_recv();
+        }
+
+        // ── Handshake timeout ──────────────────────────────────
+        if let NodeState::Handshaking { started_ns, .. } = &state {
+            if now.saturating_sub(*started_ns) > HANDSHAKE_TIMEOUT_NS {
+                eprintln!("[M13-NODE-PQC] Handshake timeout. Retrying...");
+                let reg = build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL);
+                seq_tx += 1;
+                if sock.send(&reg).is_ok() { tx_count += 1; }
+                state = NodeState::Registering;
+                assembler = Assembler::new();
+            }
+        }
+
+        // ── Keepalive (pre-Established only) ──────────────────
+        if !matches!(state, NodeState::Established { .. })
+            && (now.saturating_sub(last_keepalive_ns) > 100_000_000 || tx_count == 0) {
+            last_keepalive_ns = now;
+            let ka = build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL);
+            seq_tx += 1;
+            if sock.send(&ka).is_ok() { tx_count += 1; }
+        }
+
+        // ── Telemetry (1/sec) ─────────────────────────────────
+        if now.saturating_sub(last_report_ns) > 1_000_000_000 {
+            let state_label = match &state {
+                NodeState::Registering => "Reg",
+                NodeState::Handshaking { .. } => "HS",
+                NodeState::Established { .. } => "Est",
+                NodeState::Disconnected => "Disc",
+            };
+            eprintln!("[M13-N0] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{}",
+                rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, state_label);
+            last_report_ns = now;
+            gc_counter += 1;
+            if gc_counter.is_multiple_of(5) { assembler.gc(now); }
+        }
+
+        // Submit any pending SQEs
+        reactor.submit();
+        let _ = reactor.ring.submit_and_wait(0);
+    }
+
     if routes_installed {
         teardown_tunnel_routes(&hub_ip);
     }

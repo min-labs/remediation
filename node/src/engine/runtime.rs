@@ -192,6 +192,9 @@ pub fn calibrate_tsc() -> TscCal {
     cal
 }
 
+// Fatal error codes
+pub const E_UMEM_ALLOC_FAIL: i32 = 0x14;
+
 /// Structured fatal exit. Identical semantics to Hub version — writev atomicity.
 #[inline(never)]
 pub fn fatal(code: i32, msg: &str) -> ! {
