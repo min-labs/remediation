@@ -1,5 +1,5 @@
 [workspace]
-members = ["hub", "node"]
+members = ["hub", "node", "tests"]
 resolver = "2"
 
 [profile.release]

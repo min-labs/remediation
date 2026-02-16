@@ -9,7 +9,7 @@
 // Jitter buffer: RFC 3550 EWMA with circular release buffer
 
 use std::mem;
-use std::collections::HashMap;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use bytemuck::{Pod, Zeroable};
 use ring::aead;
@@ -102,6 +102,8 @@ pub const FEEDBACK_FRAME_LEN: u32 =
     (ETH_HDR_SIZE + M13_HDR_SIZE + mem::size_of::<FeedbackFrame>()) as u32;
 
 // Fragment sub-header. 8 bytes, prepended to payload when FLAG_FRAGMENT set.
+// DEFECT α: `packed` retained to lock wire format ABI against future field reordering.
+// Safe on ARM Cortex-A53: all fields extracted by value (Copy) via read_unaligned().
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 pub struct FragHeader {
@@ -115,170 +117,311 @@ pub const FRAG_HDR_SIZE: usize = 8;
 const _: () = assert!(mem::size_of::<FragHeader>() == FRAG_HDR_SIZE);
 
 // ============================================================================
-// FRAGMENTATION ENGINE (cold path — handshake only)
+// R-04: O(1) ZERO-ALLOCATION FRAGMENT MATRIX (HugeTLB)
 // ============================================================================
+// Replaces HashMap<u16, AssemblyBuffer> + Vec<u8> with pre-allocated slots.
+// Zero heap allocation on hot path. Closure IoC prevents Use-After-Free.
+// Literature: RFC 815 single-buffer, DPDK rte_ip_frag_table, smoltcp Assembler.
 
-/// Fragment reassembly buffer. Tracks up to 16 fragments per message.
-pub struct AssemblyBuffer {
-    fragments: [Option<Vec<u8>>; 16],
-    received_mask: u16,
-    total: u8,
-    pub first_rx_ns: u64,
+pub const MAX_FRAGMENTS: u8 = 16;
+pub const MAX_REASSEMBLY_SIZE: usize = 9216; // Absorbs 8,788B ServerHello
+pub const ASM_SLOTS_PER_PEER: usize = 8;
+
+/// Hardware-aligned reassembly slot. Maps contiguous memory for zero-copy reassembly.
+/// 9280 bytes = 145 cache lines (exact multiple of align(64)).
+#[repr(C, align(64))]
+pub struct AssemblySlot {
+    pub buf: [u8; MAX_REASSEMBLY_SIZE], // 9,216 bytes
+    pub first_rx_ns: u64,               // 8 bytes
+    pub msg_id: u16,                    // 2 bytes
+    pub received_mask: u16,             // 2 bytes
+    pub max_len: u16,                   // 2 bytes
+    pub total: u8,                      // 1 byte
+    pub active: bool,                   // 1 byte
+    // Rust pads 48 bytes to satisfy align(64) → total 9280
+}
+const _: () = assert!(mem::size_of::<AssemblySlot>() == 9280);
+const _: () = assert!(9280 % 64 == 0);
+
+impl AssemblySlot {
+    #[inline(always)]
+    pub fn reset(&mut self, msg_id: u16, total: u8, now_ns: u64) {
+        self.msg_id = msg_id;
+        self.total = total;
+        self.received_mask = 0;
+        self.max_len = 0;
+        self.first_rx_ns = now_ns;
+        self.active = true;
+    }
 }
 
-impl AssemblyBuffer {
-    pub fn new(total: u8, now_ns: u64) -> Self {
-        AssemblyBuffer { fragments: Default::default(), received_mask: 0, total, first_rx_ns: now_ns }
-    }
-    pub fn insert(&mut self, index: u8, _offset: u16, data: &[u8]) -> bool {
-        if index >= 16 || index >= self.total { return false; }
-        let bit = 1u16 << index;
-        if self.received_mask & bit != 0 { return self.is_complete(); }
-        self.fragments[index as usize] = Some(data.to_vec());
-        self.received_mask |= bit;
-        self.is_complete()
-    }
-    pub fn is_complete(&self) -> bool {
-        let expected = (1u16 << self.total) - 1;
-        self.received_mask & expected == expected
-    }
-    pub fn reassemble(&self) -> Vec<u8> {
-        let mut result = Vec::new();
-        for i in 0..self.total as usize {
-            if let Some(ref data) = self.fragments[i] { result.extend_from_slice(data); }
-        }
-        result
-    }
-}
-
-/// Per-peer fragment assembler with parallel message tracking.
+/// Zero-allocation O(1) fragment assembler.
+/// Holds a raw pointer to a pre-allocated HugeTLB arena of ASM_SLOTS_PER_PEER slots.
+/// Derives Copy: pointer is shared for single-threaded use (severs PeerTable borrow).
+///
+/// Safety: All raw pointer dereferences are guarded by null checks. The pointer is
+/// set once at boot via `Assembler::init(ptr)` from a HugeTLB arena and never freed
+/// while the Assembler is live. Single-threaded datapath — no concurrent access.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[derive(Copy, Clone)]
 pub struct Assembler {
-    pending: HashMap<u16, AssemblyBuffer>,
+    pub slots: *mut AssemblySlot,
+    pub mask: u16,
 }
+
+// Single-threaded datapath ownership. No Sync — prevents accidental sharing.
+unsafe impl Send for Assembler {}
 
 impl Default for Assembler {
     fn default() -> Self {
-        Self::new()
+        Assembler { slots: std::ptr::null_mut(), mask: (ASM_SLOTS_PER_PEER - 1) as u16 }
     }
 }
 
 impl Assembler {
-    pub fn new() -> Self { Assembler { pending: HashMap::new() } }
-    pub fn feed(&mut self, msg_id: u16, index: u8, total: u8, offset: u16,
-            data: &[u8], now_ns: u64) -> Option<Vec<u8>> {
-        let buf = self.pending.entry(msg_id).or_insert_with(|| AssemblyBuffer::new(total, now_ns));
-        if buf.insert(index, offset, data) {
-            let result = buf.reassemble();
-            self.pending.remove(&msg_id);
-            Some(result)
-        } else { None }
+    /// Initialize with pointer to pre-allocated HugeTLB arena.
+    pub fn init(ptr: *mut AssemblySlot) -> Self {
+        Assembler { slots: ptr, mask: (ASM_SLOTS_PER_PEER - 1) as u16 }
     }
+
+    /// DEFECT δ: Clear all slots without severing the HugeTLB pointer.
+    /// Used on reconnection instead of Assembler::new() which would null the pointer.
+    #[inline(always)]
+    pub fn clear_all(&mut self) {
+        if self.slots.is_null() { return; }
+        for i in 0..ASM_SLOTS_PER_PEER {
+            unsafe { (*self.slots.add(i)).active = false; }
+        }
+    }
+
+    /// Feed a fragment. On completion, calls on_complete with the reassembled slice.
+    /// Closure IoC: slot.active is cleared AFTER on_complete returns → no Use-After-Free.
+    #[inline(always)]
+    pub fn feed<F>(
+        &mut self,
+        msg_id: u16,
+        index: u8,
+        total: u8,
+        offset: u16,
+        data: &[u8],
+        now_ns: u64,
+        mut on_complete: F,
+    ) where F: FnMut(&[u8]) {
+        if total == 0 || total > MAX_FRAGMENTS || index >= total { return; }
+        if self.slots.is_null() { return; }
+
+        let off = offset as usize;
+        let dlen = data.len();
+        if off + dlen > MAX_REASSEMBLY_SIZE { return; }
+
+        let slot_idx = ((msg_id ^ (msg_id >> 3)) & self.mask) as usize;
+        let slot = unsafe { &mut *self.slots.add(slot_idx) };
+
+        // Slot collision handling: evict stale, reject active conflict
+        if slot.msg_id != msg_id {
+            if !slot.active || now_ns.saturating_sub(slot.first_rx_ns) > 5_000_000_000 {
+                slot.reset(msg_id, total, now_ns);
+            } else {
+                return; // Active slot with different msg_id — skip
+            }
+        } else if !slot.active {
+            return; // Inactive slot for this msg_id — already completed or GC'd
+        }
+
+        // Duplicate fragment guard
+        let bit = 1u16 << index;
+        if (slot.received_mask & bit) != 0 { return; }
+
+        // Copy fragment data into contiguous buffer
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), slot.buf.as_mut_ptr().add(off), dlen);
+        }
+        slot.received_mask |= bit;
+
+        let end_bound = (off + dlen) as u16;
+        if end_bound > slot.max_len { slot.max_len = end_bound; }
+
+        // Shift-overflow fix: upcast to u32 before shift (total ∈ [1,16])
+        let expected_mask = ((1u32 << total) - 1) as u16;
+
+        if slot.received_mask == expected_mask {
+            let final_len = slot.max_len as usize;
+            let complete_slice = unsafe {
+                std::slice::from_raw_parts(slot.buf.as_ptr(), final_len)
+            };
+            on_complete(complete_slice);
+            slot.active = false; // Cleared AFTER closure returns → no UaF
+        }
+    }
+
+    /// Garbage-collect stale incomplete messages (5-second timeout).
+    #[inline(always)]
     pub fn gc(&mut self, now_ns: u64) {
-        self.pending.retain(|_, buf| now_ns.saturating_sub(buf.first_rx_ns) < 5_000_000_000);
+        if self.slots.is_null() { return; }
+        for i in 0..ASM_SLOTS_PER_PEER {
+            let slot = unsafe { &mut *self.slots.add(i) };
+            if slot.active && now_ns.saturating_sub(slot.first_rx_ns) > 5_000_000_000 {
+                slot.active = false;
+            }
+        }
     }
 }
 
-// ── Fragment Builders (cold path — handshake only) ──────────────────────
+/// Allocate HugeTLB arena for assembler slots.
+/// Returns raw pointer to the first AssemblySlot or panics on failure.
+pub fn alloc_asm_arena(n_slots: usize) -> *mut AssemblySlot {
+    let size = n_slots * mem::size_of::<AssemblySlot>();
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | libc::MAP_POPULATE,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        // Fallback to regular mmap if HugeTLB not available (e.g., test environments)
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            crate::engine::runtime::fatal(
+                crate::engine::runtime::E_UMEM_ALLOC_FAIL,
+                "assembler arena mmap failed",
+            );
+        }
+        eprintln!("[M13-R04] ASM arena: {}B via regular mmap (HugeTLB unavailable)", size);
+        unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, size); }
+        return ptr as *mut AssemblySlot;
+    }
+    eprintln!("[M13-R04] ASM arena: {}B via MAP_HUGETLB", size);
+    unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, size); }
+    ptr as *mut AssemblySlot
+}
 
-use crate::network::datapath::{build_raw_udp_frame, RAW_HDR_LEN};
-use crate::engine::runtime::{TscCal, rdtsc_ns, HexdumpState};
+/// Free HugeTLB arena. Called on PeerTable drop.
+pub fn free_asm_arena(ptr: *mut AssemblySlot, n_slots: usize) {
+    if ptr.is_null() { return; }
+    let size = n_slots * mem::size_of::<AssemblySlot>();
+    unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+}
 
-/// Build fragmented handshake frames as raw ETH+IP+UDP packets for AF_XDP TX.
-/// Each frame: ETH(14) + IP(20) + UDP(8) + M13(48) + FragHdr(8) + chunk
+// ── Zero-Allocation Closure-Based Fragment Builders ─────────────────────
+
+/// Build fragmented raw UDP frames and emit each via closure (Hub ServerHello path).
+/// Zero heap allocation: stack buffers for both M13 inner frame and raw IP/UDP outer frame.
 #[allow(clippy::too_many_arguments)]
-pub fn build_fragmented_raw_udp(
+#[inline(always)]
+pub fn build_fragmented_raw_udp<F>(
     src_mac: &[u8; 6], gw_mac: &[u8; 6],
     hub_ip: [u8; 4], peer_ip: [u8; 4],
     hub_port: u16, peer_port: u16,
-    payload: &[u8],
-    flags: u8,
-    seq: &mut u64,
-    ip_id_base: &mut u16,
-    hexdump: &mut HexdumpState,
-    cal: &TscCal,
-) -> Vec<Vec<u8>> {
-    let max_chunk = 1402; // 1472 (UDP max) - 70 (M13 overhead)
+    payload: &[u8], flags: u8,
+    seq: &mut u64, ip_id_base: &mut u16,
+    mut emit: F,
+) where F: FnMut(&[u8], u32) {
+    use crate::network::datapath::build_raw_udp_frame;
+
+    let max_chunk = 1402;
     let total = payload.len().div_ceil(max_chunk);
     let msg_id = (*seq & 0xFFFF) as u16;
-    let mut frames = Vec::with_capacity(total);
+
+    let mut m13_buf = [0u8; 1500];
+    let mut raw = [0u8; 2048];
 
     for i in 0..total {
         let offset = i * max_chunk;
         let chunk_len = (payload.len() - offset).min(max_chunk);
-
         let m13_flen = ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE + chunk_len;
-        let mut m13_frame = vec![0u8; m13_flen];
-        m13_frame[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-        m13_frame[6..12].copy_from_slice(src_mac);
-        m13_frame[12] = (ETH_P_M13 >> 8) as u8;
-        m13_frame[13] = (ETH_P_M13 & 0xFF) as u8;
-        m13_frame[14] = M13_WIRE_MAGIC; m13_frame[15] = M13_WIRE_VERSION;
-        m13_frame[46..54].copy_from_slice(&seq.to_le_bytes());
-        m13_frame[54] = flags | FLAG_FRAGMENT;
-        let fh = ETH_HDR_SIZE + M13_HDR_SIZE;
-        m13_frame[fh..fh+2].copy_from_slice(&msg_id.to_le_bytes());
-        m13_frame[fh+2] = i as u8; m13_frame[fh+3] = total as u8;
-        m13_frame[fh+4..fh+6].copy_from_slice(&(offset as u16).to_le_bytes());
-        m13_frame[fh+6..fh+8].copy_from_slice(&(chunk_len as u16).to_le_bytes());
-        let dp = fh + FRAG_HDR_SIZE;
-        m13_frame[dp..dp+chunk_len].copy_from_slice(&payload[offset..offset+chunk_len]);
 
-        let raw_len = RAW_HDR_LEN + m13_flen;
-        let mut raw = vec![0u8; raw_len];
-        let flen = build_raw_udp_frame(
+        // Build M13 inner frame
+        m13_buf[0..6].copy_from_slice(&[0xFF; 6]);
+        m13_buf[6..12].copy_from_slice(src_mac);
+        m13_buf[12] = (ETH_P_M13 >> 8) as u8;
+        m13_buf[13] = (ETH_P_M13 & 0xFF) as u8;
+        m13_buf[14] = M13_WIRE_MAGIC;
+        m13_buf[15] = M13_WIRE_VERSION;
+        // Zero signature region [16..46]
+        for b in &mut m13_buf[16..46] { *b = 0; }
+        m13_buf[46..54].copy_from_slice(&seq.to_le_bytes());
+        m13_buf[54] = flags | FLAG_FRAGMENT;
+        for b in &mut m13_buf[55..59] { *b = 0; }
+
+        let fh = ETH_HDR_SIZE + M13_HDR_SIZE;
+        m13_buf[fh..fh+2].copy_from_slice(&msg_id.to_le_bytes());
+        m13_buf[fh+2] = i as u8;
+        m13_buf[fh+3] = total as u8;
+        m13_buf[fh+4..fh+6].copy_from_slice(&(offset as u16).to_le_bytes());
+        m13_buf[fh+6..fh+8].copy_from_slice(&(chunk_len as u16).to_le_bytes());
+
+        let dp = fh + FRAG_HDR_SIZE;
+        m13_buf[dp..dp+chunk_len].copy_from_slice(&payload[offset..offset+chunk_len]);
+
+        // Build raw IP/UDP outer frame
+        let total_len = build_raw_udp_frame(
             &mut raw, src_mac, gw_mac, hub_ip, peer_ip,
-            hub_port, peer_port, *ip_id_base, &m13_frame,
+            hub_port, peer_port, *ip_id_base, &m13_buf[..m13_flen],
         );
         *ip_id_base = ip_id_base.wrapping_add(1);
-        hexdump.dump_tx(raw.as_ptr(), flen, rdtsc_ns(cal));
-        frames.push(raw);
         *seq += 1;
+
+        emit(&raw[..total_len], total_len as u32);
     }
-    frames
 }
 
-/// Build fragmented handshake frames as raw L2 packets (EtherType 0x88B5).
-/// Each frame: ETH(14) + M13(48) + FragHdr(8) + chunk
-pub fn build_fragmented_l2(
+/// Build fragmented L2 frames and emit each via closure (Hub ServerHello L2 path).
+#[inline(always)]
+pub fn build_fragmented_l2<F>(
     src_mac: &[u8; 6], peer_mac: &[u8; 6],
-    payload: &[u8],
-    flags: u8,
-    seq: &mut u64,
-    hexdump: &mut HexdumpState,
-    cal: &TscCal,
-) -> Vec<Vec<u8>> {
-    let max_chunk = 1430; // 1500 - 70 (ETH+M13+FRAG overhead)
+    payload: &[u8], flags: u8, seq: &mut u64,
+    mut emit: F,
+) where F: FnMut(&[u8], u32) {
+    let max_chunk = 1402;
     let total = payload.len().div_ceil(max_chunk);
     let msg_id = (*seq & 0xFFFF) as u16;
-    let mut frames = Vec::with_capacity(total);
+    let mut frame = [0u8; 1500];
 
     for i in 0..total {
         let offset = i * max_chunk;
         let chunk_len = (payload.len() - offset).min(max_chunk);
-
         let m13_flen = ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE + chunk_len;
-        let mut m13_frame = vec![0u8; m13_flen];
-        m13_frame[0..6].copy_from_slice(peer_mac);
-        m13_frame[6..12].copy_from_slice(src_mac);
-        m13_frame[12] = (ETH_P_M13 >> 8) as u8;
-        m13_frame[13] = (ETH_P_M13 & 0xFF) as u8;
-        m13_frame[14] = M13_WIRE_MAGIC; m13_frame[15] = M13_WIRE_VERSION;
-        m13_frame[46..54].copy_from_slice(&seq.to_le_bytes());
-        m13_frame[54] = flags | FLAG_FRAGMENT;
-        let fh = ETH_HDR_SIZE + M13_HDR_SIZE;
-        m13_frame[fh..fh+2].copy_from_slice(&msg_id.to_le_bytes());
-        m13_frame[fh+2] = i as u8; m13_frame[fh+3] = total as u8;
-        m13_frame[fh+4..fh+6].copy_from_slice(&(offset as u16).to_le_bytes());
-        m13_frame[fh+6..fh+8].copy_from_slice(&(chunk_len as u16).to_le_bytes());
-        let dp = fh + FRAG_HDR_SIZE;
-        m13_frame[dp..dp+chunk_len].copy_from_slice(&payload[offset..offset+chunk_len]);
 
-        hexdump.dump_tx(m13_frame.as_ptr(), m13_flen, rdtsc_ns(cal));
-        frames.push(m13_frame);
+        frame[0..6].copy_from_slice(peer_mac);
+        frame[6..12].copy_from_slice(src_mac);
+        frame[12] = (ETH_P_M13 >> 8) as u8;
+        frame[13] = (ETH_P_M13 & 0xFF) as u8;
+        frame[14] = M13_WIRE_MAGIC;
+        frame[15] = M13_WIRE_VERSION;
+        for b in &mut frame[16..46] { *b = 0; }
+        frame[46..54].copy_from_slice(&seq.to_le_bytes());
+        frame[54] = flags | FLAG_FRAGMENT;
+        for b in &mut frame[55..59] { *b = 0; }
+
+        let fh = ETH_HDR_SIZE + M13_HDR_SIZE;
+        frame[fh..fh+2].copy_from_slice(&msg_id.to_le_bytes());
+        frame[fh+2] = i as u8;
+        frame[fh+3] = total as u8;
+        frame[fh+4..fh+6].copy_from_slice(&(offset as u16).to_le_bytes());
+        frame[fh+6..fh+8].copy_from_slice(&(chunk_len as u16).to_le_bytes());
+
+        let dp = fh + FRAG_HDR_SIZE;
+        frame[dp..dp+chunk_len].copy_from_slice(&payload[offset..offset+chunk_len]);
+
         *seq += 1;
+        emit(&frame[..m13_flen], m13_flen as u32);
     }
-    frames
 }
+
+
 
 // ============================================================================
 // PEER TABLE — DPDK/VPP-style flat array with FNV-1a linear probing
@@ -391,14 +534,20 @@ pub struct PeerTable {
     pub hs_sidecar: [Option<HubHandshakeState>; MAX_PEERS],
     tunnel_ip_bitmap: [u64; 4],
     pub ciphers: [Option<aead::LessSafeKey>; MAX_PEERS],
+    asm_arena: *mut AssemblySlot,
 }
 
 impl PeerTable {
     pub fn new(epoch_ns: u64) -> Self {
+        let total_slots = MAX_PEERS * ASM_SLOTS_PER_PEER;
+        let arena = alloc_asm_arena(total_slots);
         PeerTable {
             slots: [PeerSlot::EMPTY; MAX_PEERS],
             count: 0,
-            assemblers: std::array::from_fn(|_| Assembler::new()),
+            assemblers: std::array::from_fn(|i| {
+                let ptr = unsafe { arena.add(i * ASM_SLOTS_PER_PEER) };
+                Assembler::init(ptr)
+            }),
             epoch_ns,
             handshakes: std::array::from_fn(|_| None),
             rx_states: std::array::from_fn(|_| ReceiverState::new()),
@@ -407,6 +556,7 @@ impl PeerTable {
             hs_sidecar: std::array::from_fn(|_| None),
             tunnel_ip_bitmap: [0u64; 4],
             ciphers: std::array::from_fn(|_| None),
+            asm_arena: arena,
         }
     }
 
@@ -482,6 +632,7 @@ impl PeerTable {
         self.jitter_bufs[idx] = JitterBuffer::new();
         self.hs_sidecar[idx] = None;
         self.ciphers[idx] = None;
+        self.assemblers[idx].clear_all();
         self.count -= 1;
     }
 
@@ -520,6 +671,14 @@ impl PeerTable {
 
     pub fn gc(&mut self, _now_ns: u64) {
         // TODO: implement eviction for idle peers
+    }
+}
+
+impl Drop for PeerTable {
+    fn drop(&mut self) {
+        let total_slots = MAX_PEERS * ASM_SLOTS_PER_PEER;
+        free_asm_arena(self.asm_arena, total_slots);
+        self.asm_arena = std::ptr::null_mut();
     }
 }
 
@@ -961,48 +1120,83 @@ mod tests {
         assert_eq!(ETH_P_M13, 0x88B5);
     }
 
-    // Fragment tests
+    // Fragment tests (R-04: HugeTLB slot-based assembler)
+    fn test_assembler() -> (Assembler, *mut AssemblySlot) {
+        let arena = alloc_asm_arena(ASM_SLOTS_PER_PEER);
+        let asm = Assembler::init(arena);
+        (asm, arena)
+    }
+
     #[test]
     fn single_fragment_completes() {
-        let mut asm = Assembler::new();
-        let data = b"hello world";
-        let result = asm.feed(1, 0, 1, 0, data, 100);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), data.to_vec());
+        let (mut asm, arena) = test_assembler();
+        let mut result = Vec::new();
+        asm.feed(1, 0, 1, 0, b"hello world", 100, |data| result.extend_from_slice(data));
+        assert_eq!(&result, b"hello world");
+        free_asm_arena(arena, ASM_SLOTS_PER_PEER);
     }
 
     #[test]
     fn multi_fragment_reassembly() {
-        let mut asm = Assembler::new();
-        let part0 = b"AAAA";
-        let part1 = b"BBBB";
-        let part2 = b"CC";
-        assert!(asm.feed(42, 0, 3, 0, part0, 100).is_none());
-        assert!(asm.feed(42, 1, 3, 4, part1, 100).is_none());
-        let result = asm.feed(42, 2, 3, 8, part2, 100).unwrap();
-        assert_eq!(result, b"AAAABBBBCC");
+        let (mut asm, arena) = test_assembler();
+        let mut result = Vec::new();
+        asm.feed(42, 0, 3, 0, b"AAAA", 100, |data| result.extend_from_slice(data));
+        assert!(result.is_empty());
+        asm.feed(42, 1, 3, 4, b"BBBB", 100, |data| result.extend_from_slice(data));
+        assert!(result.is_empty());
+        asm.feed(42, 2, 3, 8, b"CC", 100, |data| result.extend_from_slice(data));
+        assert_eq!(&result, b"AAAABBBBCC");
+        free_asm_arena(arena, ASM_SLOTS_PER_PEER);
     }
 
     #[test]
     fn duplicate_fragment_ignored() {
-        let mut asm = Assembler::new();
-        assert!(asm.feed(1, 0, 2, 0, b"A", 100).is_none());
-        assert!(asm.feed(1, 0, 2, 0, b"A", 100).is_none());
-        assert!(asm.feed(1, 1, 2, 1, b"B", 100).is_some());
+        let (mut asm, arena) = test_assembler();
+        let mut count = 0usize;
+        asm.feed(1, 0, 2, 0, b"A", 100, |_| count += 1);
+        assert_eq!(count, 0);
+        asm.feed(1, 0, 2, 0, b"A", 100, |_| count += 1); // dup
+        assert_eq!(count, 0);
+        asm.feed(1, 1, 2, 1, b"B", 100, |_| count += 1);
+        assert_eq!(count, 1);
+        free_asm_arena(arena, ASM_SLOTS_PER_PEER);
     }
 
     #[test]
     fn gc_removes_stale_messages() {
-        let mut asm = Assembler::new();
-        assert!(asm.feed(1, 0, 2, 0, b"X", 100).is_none());
+        let (mut asm, arena) = test_assembler();
+        let mut count = 0usize;
+        asm.feed(1, 0, 2, 0, b"X", 100, |_| count += 1);
         asm.gc(6_000_000_100);
-        assert!(asm.feed(1, 1, 2, 1, b"Y", 6_000_000_200).is_none());
+        asm.feed(1, 1, 2, 1, b"Y", 6_000_000_200, |_| count += 1);
+        assert_eq!(count, 0);
+        free_asm_arena(arena, ASM_SLOTS_PER_PEER);
     }
 
     #[test]
     fn out_of_range_index_rejected() {
-        let mut buf = AssemblyBuffer::new(2, 0);
-        assert!(!buf.insert(16, 0, b"bad"));
-        assert!(!buf.insert(2, 0, b"bad"));
+        let (mut asm, arena) = test_assembler();
+        let mut count = 0usize;
+        asm.feed(1, 16, 2, 0, b"bad", 100, |_| count += 1);
+        asm.feed(1, 2, 2, 0, b"bad", 100, |_| count += 1);
+        assert_eq!(count, 0);
+        free_asm_arena(arena, ASM_SLOTS_PER_PEER);
+    }
+
+    #[test]
+    fn clear_all_resets_slots() {
+        let (mut asm, arena) = test_assembler();
+        let mut count = 0usize;
+        asm.feed(1, 0, 2, 0, b"A", 100, |_| count += 1);
+        asm.clear_all();
+        asm.feed(1, 1, 2, 1, b"B", 200, |_| count += 1);
+        assert_eq!(count, 0);
+        free_asm_arena(arena, ASM_SLOTS_PER_PEER);
+    }
+
+    #[test]
+    fn assembly_slot_size() {
+        assert_eq!(mem::size_of::<AssemblySlot>(), 9280);
+        assert_eq!(9280 % 64, 0);
     }
 }

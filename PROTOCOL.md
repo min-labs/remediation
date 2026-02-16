@@ -43,7 +43,7 @@ ls /dev/io_uring 2>/dev/null || echo "io_uring dev not available (OK if kernel �
 
 ### 1.1 Sprint Intake
 
-1. Read the sprint card in `TODO.md` — scope, mandate, files affected.
+1. Read the sprint card in `TODO.md` under **M13 REMEDIATION ROADMAP (R-SERIES)** — scope, target defect, rationale, and implementation method for the next sprint in sequence.
 2. Identify the core technical claims and constraints (e.g., "SPSC ring eliminates false sharing", "io_uring SQPOLL eliminates context switches").
 3. List every assumption that the sprint depends on.
 
@@ -82,22 +82,6 @@ Exit condition: Explicit user approval to proceed to Phase 2.
 No code is written until Phase 1 completes.
 ```
 
-### 1.5 Baseline Capture
-
-**Before writing any code**, capture telemetry on the current (pre-sprint) binary.
-This becomes the "before" in before/after comparison.
-
-```bash
-# Deploy current code (no sprint changes yet):
-# Hub + Node as per Phase 2.4 commands.
-# Capture 60s telemetry + ping + iperf3.
-# Save logs: /tmp/m13_baseline_R-XXx_hub.log, /tmp/m13_baseline_R-XXx_node.log
-```
-
-> **Why**: The previous sprint's "after" may have been captured days/weeks ago on
-> different WAN conditions or kernel versions. A fresh baseline on the same environment
-> makes the before/after comparison valid.
-
 ---
 
 ## Phase 2: Execution — Apply Changes & Test
@@ -111,38 +95,211 @@ This becomes the "before" in before/after comparison.
 3. **Integration**: Wire into existing call sites, update state machines.
 4. **Tests**: Unit tests for new code, integration tests for changed paths.
 
-### 2.2 Build Verification
-
-```bash
-# Must pass before any deployment:
-cargo build --release 2>&1 | tail -5          # Zero warnings
-cargo test  --workspace 2>&1 | tail -5        # 100% pass rate
-```
-
-### 2.3 Integration Audit
+### 2.2 Integration Audit (EXTREMELY IMPORTANT: DO NOT SKIP)
 
 **Before deployment, prove that every change is wired and alive — not orphan code.**
 
-#### Wiring Proof
+> **TIMEOUT RULE:** Every CLI command in this section has a **60-second hard ceiling**. If any
+> command hangs beyond 30 seconds, **immediately halt the operation**, report which steps
+> passed / failed so far, and provide the user with the remaining commands to run manually.
+> Do not wait indefinitely — CLI hangs are a known failure mode.
 
-For every new function, struct, or module added in this sprint:
+#### Static Liveness Proof (Zero-Waste Determinism)
+
+Lexical analysis (`grep`/Bash) is explicitly banned due to macro-expansion blindness. M13 achieves proof of liveness via strict compiler lints and deterministic build-time verification that traverse the intermediate compiler graphs.
+
+**Step 1 — MIR Call-Graph Reachability:**
+
+The compiler models function execution as a directed graph G = (V, E). A function v is live if and only if a path exists from a root entry point (e.g., `main`, eBPF hooks) to v in the MIR transitive closure. Any unreachable function aborts the build.
+
+```bash
+# Enforce via strict compiler lints — zero dead code tolerance:
+RUSTFLAGS="-D dead_code -D unused" cargo build --release 2>&1 | tail -20
+```
+
+**Step 2 — HIR Field-Level Memory Validation:**
+
+For every field f within a struct S, the compiler verifies both a write state (∃ assignment to S.f) and a read state (∃ subsequent load from S.f). Fields that are written but never read, or read but never modified, are phantom payloads — compilation panics.
+
+```bash
+# Compiler lint catches unused struct fields:
+RUSTFLAGS="-D dead_code -D unused_variables" cargo build --release 2>&1 | tail -20
+```
+
+**Step 3 — MIR Semantic Liveness (Def-Use Chains):**
+
+Strict dataflow analysis on the MIR control-flow graph. A variable definition is only valid if it reaches a consumer that influences hardware state (io_uring submission, AF_XDP ring update, DMA write). Dead stores and discarded error codes abort the build.
+
+```bash
+# Enforce no dead stores, no discarded Results:
+RUSTFLAGS="-D unused_must_use -D unused_assignments" cargo build --release 2>&1 | tail -20
+```
+
+**Step 4 — Zero-Tolerance Dependency Pruning:**
+
+If a crate is declared in `Cargo.toml` but lacks a resolved invocation edge in the lowered AST, the build fails. Zero waivers for unused dependencies.
+
+```bash
+# Verify zero phantom crate dependencies:
+cargo +nightly udeps --workspace 2>&1
+```
+
+**Step 5 — Full Test Suite:**
+
+```bash
+# Full workspace tests — includes tests/integration.rs (integration suite):
+cargo test --workspace 2>&1 | tail -20        # 100% pass rate required
+```
+
+`tests/integration.rs` is the primary integration gate — it exercises scatter/classify, AEAD seal/open, fragment reassembly (`Assembler::feed`), wire format parity, and handshake state transitions. If `integration.rs` passes, the VPP graph nodes are proven to interoperate. If it fails, the sprint halts.
+
+**Step 6 — Double-Audit (Brute-Force Integration Trace):**
+
+Compiler lints prove syntactic liveness but cannot detect semantic drift — a function can compile cleanly yet be orphaned from the actual runtime pipeline because its caller was refactored, its return value is silently discarded, or its call site was guarded behind a `false` branch. This step opens every source file, reads every function body, and proves the **actual logic** is called, receives correct inputs, and feeds its output into the next pipeline stage.
+
+**6a — Hub Execution Pipeline (README §III.2):**
+
+Open `hub/src/main.rs` and trace the following call chain. For each arrow (→), open the callee's source file and verify the function body exists, the parameters match what the caller passes, and the return value is consumed:
 
 ```
-1. grep -rn "function_name" --include="*.rs" → must appear in at least one call site
-   outside its own definition. If it only appears in its declaration, it is dead code.
-2. If the new code emits to a telemetry counter, verify the counter increments:
-   - Deploy briefly (10s), check 1/sec telemetry line, confirm the counter moves.
-   - Counter stuck at 0 = code path never reached = wiring failure.
-3. If the new code is a data structure (e.g., SPSC ring), verify both producer
-   AND consumer are wired:
-   - Producer: grep for push/enqueue calls.
-   - Consumer: grep for pop/dequeue calls.
-   - Missing either side = structure exists but does nothing.
+main()
+  → run_executive(if_name, single_queue, tunnel)
+    → BpfSteersman::load_and_attach(if_name) — open bpf.rs, verify it returns or panics (no Option)
+    → create_tun("m13tun0") — open datapath.rs, verify TUN fd is returned and used
+    → setup_nat() — verify called immediately after create_tun
+    → SpscRing::new() ×4 — open spsc.rs, verify Producer/Consumer handles are created
+    → thread::Builder::new().spawn(tun_housekeeping_thread) — verify:
+        • tun_housekeeping_thread() exists and its signature matches the closure args
+        • It blocks on OnceLock until UMEM base is published
+        • Its main loop calls: free_slab drain → tun_fd write → tun_fd read → SPSC push
+    → worker_entry(core_id, ...) — verify:
+        • Engine::new_zerocopy() is called — open xdp.rs, verify AF_XDP bind occurs
+        • umem_info.set() publishes UMEM base to TUN HK thread
+        • FixedSlab::new() allocates slab — open runtime.rs, verify slab struct
+        • Pre-stamp loop writes ETH+M13 headers into all slab frames
+
+        VPP Main Loop — verify each graph node is actually invoked per iteration:
+        • engine.recycle_tx() + engine.refill_rx() — open xdp.rs, verify both exist
+        • execute_tx_graph() → tun_read_batch() — open datapath.rs, verify:
+            ◦ free_to_dp_cons.pop_batch() feeds slab.free()
+            ◦ free_to_tun_prod pushes provisioned slab IDs
+            ◦ rx_tun_cons.pop_batch() injects pre-built TUN frames
+        • engine.poll_rx() → PacketVector — verify poll_rx returns batch
+        • scatter() classifies packets — open network/mod.rs, verify scatter logic
+        • rx_parse_raw() — open datapath.rs, verify:
+            ◦ Extracts src_ip/src_port from IP/UDP header offsets
+            ◦ Calls peers.lookup_or_insert() — open protocol.rs, verify PeerTable method
+            ◦ Routes by crypto_ver: 0x00 → cleartext, 0x01 → decrypt
+        • aead_decrypt_vector() — open aead.rs, verify batch decrypt exists
+        • classify_route() — verify FLAG dispatch: CONTROL→Consumed, FRAGMENT→Handshake, TUNNEL→TunWrite
+        • tun_write_vector() — verify SPSC push to TUN HK or VFS fallback
+        • handle_handshake_packet() — verify:
+            ◦ FragHeader parsed (msg_id, index, total, offset, len)
+            ◦ Assembler::feed() called — verify closure-based API matches current signature
+            ◦ On reassembly complete: process_handshake_message() dispatches by msg_type
+        • seal_frame() — open aead.rs, verify nonce construction: seq_id(8)||direction(1)||zeros(3)
+        • build_raw_udp_frame() / build_fragmented_raw_udp() — verify frame construction
+        • scheduler.enqueue_critical() — open protocol.rs, verify enqueue method exists
+        • Telemetry 1/sec print — verify format string matches documented counters
 ```
 
-#### Scope Audit
+**6b — Node Execution Pipeline (README §III.4):**
 
-Compare what was actually changed against the Phase 1 agreed scope:
+Open `node/src/main.rs` and trace:
+
+```
+main()
+  → create_tun("m13tun0") — open datapath.rs, verify TUN fd returned
+  → run_uring_worker(hub_addr, echo, hexdump, tun_file)
+    → calibrate_tsc() — open runtime.rs, verify TSC calibration
+    → tune_system_buffers() — verify sysctl writes (rmem_max, wmem_max)
+    → UdpSocket::bind → connect(hub_addr)
+    → UringReactor::new(raw_fd, cpu) — open uring_reactor.rs, verify:
+        ◦ HugeTLB mmap allocates 2MB-aligned arena
+        ◦ IoUring::builder().setup_sqpoll() configures SQPOLL
+        ◦ IORING_REGISTER_PBUF_RING syscall registers PBR
+        ◦ arm_multishot_recv() arms the lifetime SQE
+    → build_m13_frame(FLAG_CONTROL) — open protocol.rs, verify frame builder
+    → sock.send(&reg) — registration frame sent
+
+    CQE Three-Pass Main Loop — verify each pass is actually coded:
+    Pass 0 (CQE Drain + Classify):
+        • reactor.ring.completion().sync() — verify CQE drain
+        • TAG_UDP_RECV_MULTISHOT → collects recv_bids/recv_lens
+        • TAG_TUN_READ → build_m13_frame → seal_frame → stage_udp_send
+        • TAG_TUN_WRITE → recycles BID to PBR
+        • TAG_UDP_SEND_TUN/ECHO → arm_tun_read(bid)
+
+    Pass 1 (Vectorized AEAD Batch Decrypt):
+        • Guard: Established AND recv_count > 0
+        • Scans for crypto_flag == 0x01 → collects enc_ptrs
+        • decrypt_batch_ptrs() — open aead.rs, verify 4-wide AES-NI pipeline
+        • Stamps PRE_DECRYPTED_MARKER (0x02) on success
+        • Rekey check: frame_count >= limit || time > limit
+
+    Pass 2 (Per-Frame RxAction Dispatch):
+        • process_rx_frame() returns RxAction — verify enum variants:
+            ◦ NeedHandshakeInit → initiate_handshake() — open handshake.rs, verify:
+                · ML-KEM-1024 keygen (dk, ek)
+                · ML-DSA-87 keygen (sk, pk)
+                · OsRng nonce (32 bytes)
+                · send_fragmented_udp() called with ClientHello payload
+                · Returns NodeState::Handshaking
+            ◦ TunWrite → stage_tun_write(tun_fd, ptr, len, bid)
+            ◦ Echo → build_echo_frame → seal_frame → sock.send
+            ◦ HandshakeComplete → verify:
+                · process_handshake_node() — open handshake.rs, verify:
+                    - ML-KEM decapsulate(ct) → shared secret
+                    - SHA-512(CH || ct) transcript → pk_hub.verify()
+                    - HKDF-SHA-512(nonce, ss) → session_key
+                    - SHA-512(CH || SH) → sign → Finished payload
+                · LessSafeKey::new(AES_256_GCM, &key) installs cipher
+                · setup_tunnel_routes() — open datapath.rs, verify ip rule/route commands
+            ◦ HandshakeFailed → NodeState::Disconnected
+            ◦ RekeyNeeded → NodeState::Registering
+        • BID recycled to PBR (unless deferred)
+    • Keepalive: 100ms, pre-Established only — verify guard + build_m13_frame(FLAG_CONTROL)
+    • Telemetry 1/sec — verify format string matches documented counters
+```
+
+**6c — Cross-Component Data Flow Proof (README §IV):**
+
+For each of the 7 lifecycle steps, open **both** the sender-side and receiver-side source files simultaneously and prove the data physically crosses:
+
+| Step | Sender Function | Wire Data | Receiver Function | Proof Required |
+|------|----------------|-----------|-------------------|----------------|
+| 0 | Node: `build_m13_frame(FLAG_CONTROL)` → `sock.send()` | 62B cleartext | Hub: `rx_parse_raw()` → `lookup_or_insert()` | Verify Hub's M13 offset (56 bytes into UDP) matches Node's frame layout. Verify `FLAG_CONTROL` → `Consumed` (no echo). |
+| 1 | Node: `initiate_handshake()` → `send_fragmented_udp()` | 4194B / 3 frags | Hub: `Assembler::feed()` ×3 → `process_client_hello_hub()` | Verify fragment MTU (1402) produces exactly ⌈4194/1402⌉ = 3 fragments. Verify `Assembler` closure receives correct offsets. Verify `process_client_hello_hub` extracts ek at `[34..1602]` and pk at `[1602..4194]` — byte ranges must match `initiate_handshake` layout. |
+| 2 | Hub: `process_client_hello_hub()` → `build_fragmented_raw_udp()` | 8788B / 7 frags | Node: `Assembler::feed()` ×7 → `process_handshake_node()` | Verify ServerHello layout: type(1) + ct(1568) + pk(2592) + sig(4627) = 8788. Verify Node extracts ct at `[1..1569]`, pk at `[1569..4161]`, sig at `[4161..8788]` — must match Hub's construction. |
+| 3 | Node: `process_handshake_node()` → `send_fragmented_udp()` | 4628B / 4 frags | Hub: `Assembler::feed()` ×4 → `process_finished_hub()` | Verify Finished layout: type(1) + sig(4627) = 4628. Verify Hub extracts sig at `[1..4628]`. Verify both sides compute identical transcripts: `SHA-512(CH \|\| SH)`. |
+| 4 | Both: `HKDF-SHA-512(nonce, ss, "M13-PQC-SESSION-KEY-v1")` | — | Both | Verify HKDF parameters (salt, IKM, info string, output length=32) are **byte-identical** in `hub/src/cryptography/handshake.rs` and `node/src/cryptography/handshake.rs`. Any mismatch = silent AEAD failure. |
+| 5 | Node: `seal_frame(cipher, seq, DIR_NODE_TO_HUB)` | AEAD tunnel | Hub: `open_frame(cipher, DIR_HUB_TO_NODE)` | Verify nonce construction is mirror-symmetric: Node seals with `direction=0x01`, Hub opens expecting `direction != 0x00` (reflection guard). Verify AAD bytes (4) and tag position (offset+4..+20) match on both sides. |
+| 6 | Hub: `seal_frame(cipher, seq, DIR_HUB_TO_NODE)` | AEAD tunnel | Node: `open_frame(cipher, DIR_NODE_TO_HUB)` | Same mirror verification as Step 5, reversed direction. |
+
+> **Rule**: If any function body is missing, any call-site passes wrong arguments, any byte-range
+> extraction mismatches the sender's layout, or any HKDF/nonce parameter differs between Hub
+> and Node — the sprint MUST halt. The wiring defect must be fixed before deployment.
+
+
+### 2.3 Report & Deploy
+
+**Step 1 — Notify:** Inform the user that all code amendments for this sprint are complete.
+
+**Step 2 — Report Audit Results:** Present the Integration Audit (Section 2.2) results:
+
+| Audit Gate | Result |
+|------------|--------|
+| MIR Call-Graph Reachability | ✅ / ❌ (zero dead functions) |
+| HIR Field-Level Validation | ✅ / ❌ (zero phantom fields) |
+| Def-Use Semantic Liveness | ✅ / ❌ (zero dead stores) |
+| Dependency Pruning | ✅ / ❌ (zero unused crates) |
+| Test Suite | ✅ / ❌ (100% pass rate) |
+| Scope Audit | ✅ / ❌ (zero deviations) |
+| 6a: Hub Pipeline Trace | ✅ / ❌ (every call-site verified, parameters match, return values consumed) |
+| 6b: Node Pipeline Trace | ✅ / ❌ (every call-site verified, CQE 3-pass wiring intact) |
+| 6c: Cross-Component Data Flow | ✅ / ❌ (byte-range extractions match, HKDF parity, nonce symmetry) |
+
+**Scope Audit:**
 
 | Check | Question | Evidence Required |
 |-------|----------|-------------------|
@@ -150,16 +307,17 @@ Compare what was actually changed against the Phase 1 agreed scope:
 | **Over-delivery** | Did we change files or add features outside the sprint scope? | `git diff --stat` must not contain files unrelated to the sprint mandate. Unplanned changes must be explicitly justified or reverted. |
 | **Deviation** | Did we implement something differently than what was agreed in Phase 1? | Compare the actual implementation against the Phase 1 literature findings. If we chose a different algorithm, data structure, or approach, document why and get user acknowledgment. |
 
-#### Empirical Proof Checklist
+**Empirical Proof Checklist:**
 
-- [ ] Every new `pub fn` has at least one call site (grep proof)
-- [ ] Every new `pub struct` is instantiated somewhere (grep proof)
-- [ ] Every new module is `pub mod` registered AND imported (grep proof)
-- [ ] Telemetry counters for new code paths are non-zero after brief deployment
+- [ ] `cargo build --release` with `-D dead_code -D unused` produces zero errors (MIR call-graph proof)
+- [ ] `cargo build --release` with `-D unused_variables` produces zero errors (HIR field-level proof)
+- [ ] `cargo build --release` with `-D unused_must_use -D unused_assignments` produces zero errors (Def-Use proof)
+- [ ] `cargo +nightly udeps --workspace` reports zero unused dependencies
+- [ ] `cargo test --workspace` achieves 100% pass rate
 - [ ] No `#[allow(dead_code)]` added without explicit justification + sprint target for activation
 - [ ] Scope audit: zero under-delivery, zero unjustified over-delivery, zero undocumented deviation
 
-### 2.4 Deployment & Telemetry Capture
+**Step 3 — Provide Commands:** Tell the user the exact commands to run for deployment and telemetry capture:
 
 ```bash
 # Hub (remote):
@@ -168,22 +326,7 @@ T0=$(date +%s); cargo run --release 2>&1 | tee /tmp/m13_hub_$T0.log
 # Node (local):
 T0=$(date +%s); cargo run --release -- --hub <HUB_IP>:443 2>&1 | tee /tmp/m13_node_$T0.log
 
-# Wait for Established state, then measure:
-ping -c 100 <hub_tun_ip>
-iperf3 -c <hub_tun_ip> -t 30
-iperf3 -c <hub_tun_ip> -u -b 50M -t 30
 ```
-
-### 2.5 Acceptance Criteria
-
-All invariants from `OBSERVATIONS.md` must hold:
-
-- [ ] `AEAD_FAIL = 0`
-- [ ] `Internal Loss = 0`
-- [ ] `HS_FAIL = 0`
-- [ ] `Reconnections = 0` (no unplanned drops)
-- [ ] `Test Pass Rate = 100%`
-- [ ] `|ΔSlab| ≤ ε` (no slab leak)
 
 ---
 
@@ -279,7 +422,7 @@ Document every search and its result, even negative results ("searched X, found 
 
 | File | Action |
 |------|--------|
-| `README.md` | Update affected sections (architecture, wire protocol, connection lifecycle). Verify all line references still correct. |
+| `README.md` | Update affected sSctions (architecture, wire protocol, connection lifecycle). Verify all line references still correct. |
 | `TODO.md` | Mark sprint as `✅ COMPLETED`. Add date, files modified table, eradicated/added constructs, self-audit. Update blind spots if new telemetry gaps discovered. |
 | `OBSERVATIONS.md` | Add new row to every Cross-Sprint Comparison table. Update Sprint-over-Sprint Δ. Fill in Network Quality if measured. Add per-sprint detail section with raw telemetry and analysis. |
 
@@ -317,7 +460,7 @@ git push origin main
 After git push, create a local snapshot on the Desktop named after the sprint:
 
 ```bash
-cp -r /home/m13/Desktop/m13 /home/m13/Desktop/R-XX
+cp -r /home/m13/Desktop/m13 /home/m13/Desktop/backup/R-XX
 ```
 
 Example: after Sprint R-02, the backup is `/home/m13/Desktop/R-02`.

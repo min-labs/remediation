@@ -204,6 +204,9 @@ pub struct GraphCtx<'a> {
     pub rx_tun_cons: Option<&'a mut Consumer<PacketDesc>>,
     pub free_to_tun_prod: Option<&'a mut Producer<u32>>,
     pub free_to_dp_cons: Option<&'a mut Consumer<u32>>,
+    // DEFECT ε FIXED: Observability exports for TX hexdump and TSC timing
+    pub hexdump: &'a mut crate::engine::runtime::HexdumpState,
+    pub cal: crate::engine::runtime::TscCal,
 }
 
 #[derive(Default, Clone)]

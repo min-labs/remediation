@@ -39,17 +39,19 @@ Node (io_uring) ──WiFi 7──→ Hub (O(1) Re-Order Buffer) ──Multi-Pat
 
 ```text
 m13/
-├── Cargo.toml                      ← workspace: [hub, node], release: LTO, panic=abort, codegen-units=1
+├── Cargo.toml                      ← workspace: [hub, node, tests], release: LTO, panic=abort, codegen-units=1
 ├── README.md
 ├── TODO.md                         ← Roadmap & technical debt ledger
+│
+├── tests/                          ← INTEGRATION TEST SUITE (workspace member: m13-tests)
+│   ├── Cargo.toml                  ← depends on m13-hub; ring, ml-kem, ml-dsa, sha2, hkdf, rand
+│   └── integration.rs              ← 30 integration tests: VPP graph, AEAD, PQC handshake, wire parity
 │
 ├── hub/                            ← THE HUB (AF_XDP / Satellite Aggregator)
 │   ├── Cargo.toml                  ← libc, ring, libbpf-sys, bytemuck, ml-kem, ml-dsa, sha2, hkdf, rand
 │   ├── build.rs                    ← eBPF object compilation & kernel bindgen
 │   ├── m13-hub.bb                  ← Yocto BitBake recipe
 │   ├── m13-hub.p4                  ← P4 behavioral model
-│   ├── tests/
-│   │   └── pipeline.rs             ← VPP graph integration tests
 │   └── src/
 │       ├── lib.rs                  ← Public re-exports for tests
 │       ├── main.rs                 ← Orchestrator: main → run_executive → worker_entry → VPP loop
@@ -91,47 +93,7 @@ m13/
 
 ---
 
-## III. Phase 0: Silicon Provisioning & Micro-Architecture Isolation
-
-### Target Flight Hardware: AMD/Xilinx K26 SOM (Hub & Node)
-
-**Silicon Geometry:** The Zynq UltraScale+ MPSoC possesses a **Quad-Core ARM Cortex-A53**.
-
-*   **Core 0:** Reserved for Linux Housekeeping (SMMU, VFS locks, SSH, unpinned hardIRQs).
-*   **Cores 1, 2, 3:** Physically isolated for M13's Net I/O, Datapath, and Crypto threads.
-*   **Memory:** 4GB total DDR4. We lock 512MB (`hugepages=256`) for the zero-copy Arenas.
-
-**Implementation (Yocto EDF / U-Boot):**
-Do not attempt to use `update-grub`. Append the kernel parameters via your Yocto `machine.conf`, Device Tree (`system-user.dtsi`), or dynamically at runtime via `extlinux.conf`.
-
-```bash
-# 1. Modify the U-Boot extlinux configuration on the K26 SOM
-sudo sed -i '/^[[:space:]]*append/ s/$/ isolcpus=1,2,3 rcu_nocbs=1,2,3 nohz_full=1,2,3 irqaffinity=0 hugepagesz=2M hugepages=256/' /boot/extlinux/extlinux.conf
-
-# 2. Sync filesystem and reboot to apply silicon isolation
-sync && sudo reboot
-
-```
-
-> **Verification Post-Reboot:**
-> 1. Verify CPU Isolation: `cat /sys/devices/system/cpu/isolated` → Must output exactly `1-3`.
-> 2. Verify HugePage allocation: `cat /proc/sys/vm/nr_hugepages` → Must output `256`.
-> *If either check fails, the pipeline will fall back to the CFS scheduler and the mission MUST be aborted.*
-> 
-
-### Build Dependencies (Run on K26 or Cross-Compile Host)
-
-```bash
-# Install Rust HFT Toolchain & Kernel 6.12+ Headers
-sudo apt update && sudo apt install -y curl build-essential clang llvm libbpf-dev pkg-config libelf-dev make linux-headers-$(uname -r)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup default stable && rustup update
-
-```
-
----
-
-## IV. Phase 1: Build & Execution Chains
+## III. Phase 1: Build & Execution Chains
 
 ### 1. Hub Build
 
@@ -163,75 +125,76 @@ sudo RUST_LOG=debug ./target/release/m13-hub enp1s0f0 --tunnel --single-queue 0
 **Exact execution sequence** (`hub/src/main.rs`):
 
 ```text
-main() [L42]
-├── Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN [L46-48]
-├── Panic hook: nuke_cleanup_hub() on unwind [L52-57]
-├── CLI parse: if_name="enp1s0f0", tunnel=true, single_queue=Some(0) [L63-101]
-├── Set M13_LISTEN_PORT=443 (default) [L107-121]
-└── run_executive(&if_name, single_queue, tunnel) [L122]
+main()
+├── Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN
+├── Panic hook: nuke_cleanup_hub() on unwind
+├── CLI parse: if_name="enp1s0f0", tunnel=true, single_queue=Some(0)
+├── Set M13_LISTEN_PORT=443 (default)
+└── run_executive(&if_name, single_queue, tunnel)
 
-run_executive() [L126]
-├── Pre-flight cleanup [L136-183]:
-│   ├── Kill stale m13-hub processes via pgrep/SIGKILL [L139-151]
-│   ├── Detach stale XDP: ip link set <if> xdp off [L154-155]
-│   ├── [R-01] ethtool -L <if> combined 1 — collapse NIC to single queue [L157-174]
-│   └── Auto-allocate hugepages: write (workers × UMEM_SIZE / 2MB) to procfs [L176-182]
-├── TSC calibration (rdtsc loop) [L187]
-├── lock_pmu() + fence_interrupts() + discover_isolated_cores() [L189-193]
-├── Worker count = 1 (single-queue mode) [L197-200]
-├── [R-01] BpfSteersman::load_and_attach(if_name) → direct return (panics on failure) [L205-206]
-├── Create TUN interface m13tun0 + setup_nat() [L210-214]
+run_executive()
+├── Pre-flight cleanup:
+│   ├── Kill stale m13-hub processes via pgrep/SIGKILL
+│   ├── Detach stale XDP: ip link set <if> xdp off
+│   ├── [R-01] ethtool -L <if> combined 1 — collapse NIC to single queue
+│   └── Auto-allocate hugepages: write (workers × UMEM_SIZE / 2MB) to procfs
+├── TSC calibration (rdtsc loop)
+├── lock_pmu() + fence_interrupts() + discover_isolated_cores()
+├── Worker count = 1 (single-queue mode)
+├── [R-01] BpfSteersman::load_and_attach(if_name) → direct return (panics on failure)
+├── Create TUN interface m13tun0 + setup_nat()
 │
-├── [R-02A] SPSC Ring Creation [L216-225]:
+├── [R-02A] SPSC Ring Creation:
 │   ├── 4 rings × depth 2048:
 │   │   ├── tx_tun: Producer<PacketDesc> → Consumer<PacketDesc>     (datapath → TUN HK)
 │   │   ├── rx_tun: Producer<PacketDesc> → Consumer<PacketDesc>     (TUN HK → datapath)
 │   │   ├── free_to_tun: Producer<u32> → Consumer<u32>             (datapath → TUN HK slab IDs)
 │   │   └── free_to_dp: Producer<u32> → Consumer<u32>              (TUN HK → datapath slab IDs)
-│   └── OnceLock<(usize, u32)> for UMEM base sharing [L230-231]
+│   └── OnceLock<(usize, u32)> for UMEM base sharing
 │
-├── [R-02A] TUN Housekeeping Thread spawn [L234-252]:
+├── [R-02A] TUN Housekeeping Thread spawn:
 │   ├── Pinned to last isolated core
 │   ├── Receives: tx_tun_cons, rx_tun_prod, free_to_tun_cons, free_to_dp_prod, umem_info
-│   └── tun_housekeeping_thread() [L759-933]:
-│       ├── Block until OnceLock published by Worker 0 [L774-783]
-│       ├── DPDK-style local cache: [u32; 4096] pending_return [L790]
+│   └── tun_housekeeping_thread():
+│       ├── Block until OnceLock published by Worker 0
+│       ├── DPDK-style local cache: [u32; 4096] pending_return
 │       └── Main loop:
-│           ├── Phase 0: Drain pending_return → free_slab_tx [L808-815]
-│           ├── Phase 1 (TX): Pop PacketDesc from rx_from_dp → write(tun_fd) → return slab [L820-852]
+│           ├── Phase 0: Drain pending_return → free_slab_tx
+│           ├── Phase 1 (TX): Pop PacketDesc from rx_from_dp → write(tun_fd) → return slab
 │           └── Phase 2 (RX): poll(POLLIN,1ms) → alloc from free_slab_rx → read(tun_fd) → 
-│               build Eth+M13 header in UMEM → push PacketDesc to tx_to_dp [L858-919]
+│               build Eth+M13 header in UMEM → push PacketDesc to tx_to_dp
 │
-├── Worker 0 handle distribution via .take() [L260-276]:
+├── Worker 0 handle distribution via .take():
 │   └── Only worker 0 gets SPSC Producer/Consumer handles
 │
-└── worker_entry() [L938]:
-    ├── pin_to_core(core_id) + verify_affinity() [L947-948]
-    ├── Engine::new_zerocopy(if_name, queue_id, bpf_map_fd) → AF_XDP bind [L952]
-    ├── [R-02A] umem_info.set((umem_base, FRAME_SIZE)) → unblock TUN HK [L956-959]
-    ├── FixedSlab::new(8192), Scheduler, PeerTable, ReceiverState [L961-972]
-    ├── Pre-stamp all 8192 slab frames with Eth+M13 headers [L1000-1015]
+└── worker_entry():
+    ├── pin_to_core(core_id) + verify_affinity()
+    ├── Engine::new_zerocopy(if_name, queue_id, bpf_map_fd) → AF_XDP bind
+    ├── [R-02A] umem_info.set((umem_base, FRAME_SIZE)) → unblock TUN HK
+    ├── FixedSlab::new(8192), Scheduler, PeerTable, ReceiverState
+    ├── Pre-stamp all 8192 slab frames with Eth+M13 headers
     │
-    └── VPP Main Loop [L1016+]:
-        ├── SHUTDOWN check [L1029]
-        ├── engine.recycle_tx() + engine.refill_rx() [L1080-1081]
+    └── VPP Main Loop:
+        ├── SHUTDOWN check
+        ├── engine.recycle_tx() + engine.refill_rx()
         │
-        ├── TUN TX Graph (worker 0 only) [L1086-1116]:
-        │   ├── Build GraphCtx with SPSC handles [L1087-1112]
-        │   │   tx_tun_prod, rx_tun_cons, free_to_tun_prod, free_to_dp_cons
+        ├── TUN TX Graph (worker 0 only):
+        │   ├── Build GraphCtx with SPSC handles + hexdump + cal
+        │   │   tx_tun_prod, rx_tun_cons, free_to_tun_prod, free_to_dp_cons,
+        │   │   hexdump: &mut HexdumpState, cal: TscCal
         │   └── execute_tx_graph(&mut ctx) → tun_read_batch():
-        │       ├── Reclaim returned slabs: free_to_dp_cons.pop_batch() → slab.free() [datapath.rs:530-536]
-        │       ├── Demand-driven provision: free_to_tun_prod.available() → bounded alloc [datapath.rs:538-562]
-        │       └── Pop pre-built TUN frames: rx_tun_cons.pop_batch() → inject [datapath.rs:565-574]
+        │       ├── Reclaim returned slabs: free_to_dp_cons.pop_batch() → slab.free()
+        │       ├── Demand-driven provision: free_to_tun_prod.available() → bounded alloc
+        │       └── Pop pre-built TUN frames: rx_tun_cons.pop_batch() → inject
         │
-        ├── RX Graph [L1135-1245]:
-        │   ├── engine.poll_rx() → PacketVector [L1143]
+        ├── RX Graph:
+        │   ├── engine.poll_rx() → PacketVector
         │   ├── scatter() → per-packet classification [network/mod.rs]
         │   ├── VPP graph nodes: rx_parse, classify, aead_decrypt_vector, handshake
-        │   ├── tun_write_vector() → SPSC push or VFS fallback [datapath.rs]
-        │   └── Build GraphCtx with SPSC handles [L1178-1230]
+        │   ├── tun_write_vector() → SPSC push or VFS fallback
+        │   └── Build GraphCtx with SPSC handles + hexdump + cal
         │
-        └── Telemetry: 1/sec report [L1117-1132]:
+        └── Telemetry: 1/sec report:
             RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{}
 ```
 
@@ -262,81 +225,81 @@ sudo RUST_LOG=debug ./target/release/m13-node --hub-ip 67.213.122.195:443 --tunn
 **Exact execution sequence** (`node/src/main.rs`):
 
 ```text
-main() [L36]
-├── Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN [L41-43]
-├── Panic hook: nuke_cleanup_node() [L47-51]
-├── CLI parse: echo=false, hexdump=false, tunnel=true [L53-55]
-├── create_tun("m13tun0") → TUN fd [L59-63]
-├── Parse --hub-ip "67.213.122.195:443" [L66-73]
-├── Store Hub IP in HUB_IP_GLOBAL Mutex (for panic hook route teardown) [L77-79]
-└── run_uring_worker(&ip, echo, hexdump, tun_file) [L80]
+main()
+├── Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN
+├── Panic hook: nuke_cleanup_node()
+├── CLI parse: echo=false, hexdump=false, tunnel=true
+├── create_tun("m13tun0") → TUN fd
+├── Parse --hub-ip "67.213.122.195:443"
+├── Store Hub IP in HUB_IP_GLOBAL Mutex (for panic hook route teardown)
+└── run_uring_worker(&ip, echo, hexdump, tun_file)
 
-run_uring_worker() [L700]
-├── TSC calibration: calibrate_tsc() [L703]
-├── System tuning: tune_system_buffers() [L704]
-│   └── sysctl: net.core.rmem_max, wmem_max, netdev_max_backlog [L304-326]
-├── UdpSocket::bind("0.0.0.0:0") → connect(hub_addr) [L707-710]
-├── Socket tuning: SO_RCVBUFFORCE=8MB, SO_SNDBUFFORCE=8MB [L716-722]
+run_uring_worker()
+├── TSC calibration: calibrate_tsc()
+├── System tuning: tune_system_buffers()
+│   └── sysctl: net.core.rmem_max, wmem_max, netdev_max_backlog
+├── UdpSocket::bind("0.0.0.0:0") → connect(hub_addr)
+├── Socket tuning: SO_RCVBUFFORCE=8MB, SO_SNDBUFFORCE=8MB
 │
-├── UringReactor::new(raw_fd, cpu=0) [L728]:
-│   ├── uring_reactor.rs [L72-145]:
-│   │   ├── HugeTLB mmap: 2MB-aligned arena (PBR metadata + data frames) [L76-86]
-│   │   ├── IoUring::builder().setup_sqpoll(2000ms).setup_single_issuer() [L87-96]
-│   │   ├── SYS_io_uring_register IORING_REGISTER_PBUF_RING [L98-116]
-│   │   └── Pre-register all BIDs in PBR [L118-128]
-│   └── arm_multishot_recv() → single SQE for lifetime of socket [L147-165]
+├── UringReactor::new(raw_fd, cpu=0):
+│   ├── uring_reactor.rs:
+│   │   ├── HugeTLB mmap: 2MB-aligned arena (PBR metadata + data frames)
+│   │   ├── IoUring::builder().setup_sqpoll(2000ms).setup_single_issuer()
+│   │   ├── SYS_io_uring_register IORING_REGISTER_PBUF_RING
+│   │   └── Pre-register all BIDs in PBR
+│   └── arm_multishot_recv() → single SQE for lifetime of socket
 │
-├── TUN fd extraction + arm TUN reads [L732-740]
-├── Counter init: seq_tx, rx/tx/aead/tun counters [L742-748]
-├── Build M13 header template (src_mac, hub_mac, magic, version) [L767-773]
-├── Send initial registration frame [L760-762]
-├── State machine init: NodeState::Registering [L764]
+├── TUN fd extraction + arm TUN reads
+├── Counter init: seq_tx, rx/tx/aead/tun counters
+├── Build M13 header template (src_mac, hub_mac, magic, version)
+├── Send initial registration frame
+├── State machine init: NodeState::Registering
 │
-└── CQE Three-Pass Main Loop [L777+]:
-    ├── SHUTDOWN check [L778]
-    ├── Connection timeout: 30s pre-Established [L782-786]
+└── CQE Three-Pass Main Loop:
+    ├── SHUTDOWN check
+    ├── Connection timeout: 30s pre-Established
     │
-    ├── ═══ Pass 0: CQE Drain + Classify ═══ [L798-890]
-    │   ├── reactor.ring.completion().sync() [L799]
-    │   ├── Drain up to 128 CQEs into cqe_batch[] [L800-808]
+    ├── ═══ Pass 0: CQE Drain + Classify ═══
+    │   ├── reactor.ring.completion().sync()
+    │   ├── Drain up to 128 CQEs into cqe_batch[]
     │   ├── For each CQE, classify by tag:
-    │   │   ├── TAG_UDP_RECV_MULTISHOT → collect into recv_bids[]/recv_lens[] [L823-842]
-    │   │   ├── TAG_TUN_READ → build M13 header in-place → seal_frame → stage_udp_send [L846-874]
-    │   │   ├── TAG_TUN_WRITE → recycle BID to PBR [L876-879]
-    │   │   └── TAG_UDP_SEND_TUN/ECHO → arm_tun_read(bid) to recycle BID [L881-886]
+    │   │   ├── TAG_UDP_RECV_MULTISHOT → collect into recv_bids[]/recv_lens[]
+    │   │   ├── TAG_TUN_READ → build M13 header in-place → seal_frame → stage_udp_send
+    │   │   ├── TAG_TUN_WRITE → recycle BID to PBR
+    │   │   └── TAG_UDP_SEND_TUN/ECHO → arm_tun_read(bid) to recycle BID
     │   └── recv_count = number of UDP recv CQEs in this batch
     │
-    ├── ═══ Pass 1: Vectorized AEAD Batch Decrypt ═══ [L892-937]
+    ├── ═══ Pass 1: Vectorized AEAD Batch Decrypt ═══
     │   ├── If Established AND recv_count > 0:
-    │   │   ├── Scan recv frames for crypto_flag == 0x01 → collect enc_ptrs[] [L903-918]
-    │   │   ├── decrypt_batch_ptrs(enc_ptrs, enc_lens, enc_count, cipher) [L920-927]
+    │   │   ├── Scan recv frames for crypto_flag == 0x01 → collect enc_ptrs[]
+    │   │   ├── decrypt_batch_ptrs(enc_ptrs, enc_lens, enc_count, cipher)
     │   │   │   └── 4-at-a-time AES-NI prefetch saturates crypto pipeline
     │   │   │   └── Stamps PRE_DECRYPTED_MARKER (0x02) on success
-    │   │   └── Rekey check: frame_count >= limit || time > limit [L930-934]
+    │   │   └── Rekey check: frame_count >= limit || time > limit
     │
-    ├── ═══ Pass 2: Per-Frame RxAction Dispatch ═══ [L939-1026]
+    ├── ═══ Pass 2: Per-Frame RxAction Dispatch ═══
     │   ├── For each recv frame (PRE_DECRYPTED_MARKER skips scalar decrypt):
-    │   │   ├── process_rx_frame() → RxAction [L954-955]
-    │   │   ├── RxAction::NeedHandshakeInit → initiate_handshake() (PQC ClientHello) [L959-962]
-    │   │   ├── RxAction::TunWrite → stage_tun_write(tun_fd, ptr, len, bid) [L964-973]
-    │   │   ├── RxAction::Echo → build_echo_frame → seal_frame → sock.send [L975-985]
-    │   │   ├── RxAction::HandshakeComplete → derive AEAD key → NodeState::Established [L987-1011]
-    │   │   │   └── setup_tunnel_routes(&hub_ip) [L1007-1010]
-    │   │   ├── RxAction::HandshakeFailed → NodeState::Disconnected [L1012-1015]
-    │   │   └── RxAction::RekeyNeeded → NodeState::Registering [L1016-1018]
-    │   └── Recycle BID to PBR (unless deferred by TunWrite) [L1022-1025]
+    │   │   ├── process_rx_frame() → RxAction
+    │   │   ├── RxAction::NeedHandshakeInit → initiate_handshake() (PQC ClientHello)
+    │   │   ├── RxAction::TunWrite → stage_tun_write(tun_fd, ptr, len, bid)
+    │   │   ├── RxAction::Echo → build_echo_frame → seal_frame → sock.send
+    │   │   ├── RxAction::HandshakeComplete → derive AEAD key → NodeState::Established
+    │   │   │   └── setup_tunnel_routes(&hub_ip)
+    │   │   ├── RxAction::HandshakeFailed → NodeState::Disconnected
+    │   │   └── RxAction::RekeyNeeded → NodeState::Registering
+    │   └── Recycle BID to PBR (unless deferred by TunWrite)
     │
-    ├── Re-arm multishot recv if terminated [L1028-1031]
-    ├── Handshake timeout → re-register [L1033-1043]
-    ├── Keepalive: 100ms, pre-Established only [L1045-1052]
-    ├── Telemetry: 1/sec [L1054-1067]:
+    ├── Re-arm multishot recv if terminated
+    ├── Handshake timeout → re-register
+    ├── Keepalive: 100ms, pre-Established only
+    ├── Telemetry: 1/sec:
     │   RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{}
-    └── reactor.submit() + submit_and_wait(0) [L1069-1071]
+    └── reactor.submit() + submit_and_wait(0)
 ```
 
 ---
 
-## V. Connection Lifecycle: Registration → PQC Handshake → Established Tunnel
+## IV. Connection Lifecycle: Registration → PQC Handshake → Established Tunnel
 
 This section traces the **complete end-to-end datapath** from the moment a Node starts to the point where bidirectional AEAD-encrypted tunnel traffic flows. Every step is canonical, deterministic, and traceable to a specific source location.
 
@@ -394,7 +357,7 @@ offset + 32: [encrypted region begins]                    ← seq_id, flags, pay
 offset + 48: [payload begins]                             ← IP packet or fragment data
 ```
 
-**Nonce construction** (`seal_frame`, line 14-15 in `aead.rs`):
+**Nonce construction** (`seal_frame` in `aead.rs`):
 - `nonce[0..8]` = `seq_id` as LE u64 (full 64-bit sequence number)
 - `nonce[8]` = `direction` byte (`0x00` = Hub→Node, `0x01` = Node→Hub)
 - `nonce[9..12]` = `0x00` (zero-padded to 12 bytes)
@@ -472,7 +435,7 @@ offset + 48: [payload begins]                             ← IP packet or fragm
      │◄═══════════════════════════════════════════╬═══════════════════════ AEAD Tunnel ═══│
      │                                            │                                       │
      │  ┌─ Failure Paths ─────────────────────────┼──────────────────────────────────────┐│
-     │  │ • HS timeout (5s):  re-register + Assembler::new → Step 0                      ││
+     │  │ • HS timeout (5s):  re-register + assembler.clear_all() → Step 0                ││
      │  │ • Conn timeout (30s, io_uring): process exit                                   ││
      │  │ • Rekey (2³² frames or 3600s): → Registering → Step 0 (session key rotated)    ││
      │  │ • HS failure: → Disconnected (wait for next valid frame → Registering)         ││
@@ -526,9 +489,9 @@ Hub — hub/src/network/datapath.rs
 The Node sends `FLAG_CONTROL` frames every 100ms while **not** in `Established` state. These keepalives serve two purposes: (1) maintain the NAT/firewall UDP binding on the public internet, and (2) signal liveness to the Hub. **Keepalives stop immediately when the session is established** — tunnel traffic maintains the binding naturally.
 
 ```text
-Node — node/src/main.rs (both paths: recvmmsg L604-612, io_uring L1045-1052)
+Node — node/src/main.rs (both paths: recvmmsg and io_uring)
 ├── Guard: !matches!(state, Established) && (now - last_keepalive_ns > 100ms)
-├── build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL)  [protocol.rs:59]
+├── build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL)
 ├── sock.send(&ka)  →  tx_count += 1
 └── Stops: immediately on transition to NodeState::Established
 ```
@@ -558,7 +521,8 @@ Node — node/src/main.rs + node/src/cryptography/handshake.rs
 │   │   └── pk (ML-DSA-87) ──────────────────── 2592 bytes
 │   │   Total: 4194 bytes
 │   │
-│   ├── send_fragmented_udp(sock, ..., payload, flags)          [protocol.rs:163]
+│   ├── send_fragmented_udp(src, dst, payload, flags, seq,      [protocol.rs:283]
+│   │                        |frame| { sock.send(frame); })      ← closure-based emit
 │   │   ├── max_chunk = 1402 bytes per fragment
 │   │   ├── FragHeader per chunk: msg_id(2) + index(1) + total(1) + offset(2) + len(2) = 8 bytes
 │   │   ├── Fragment 0/3: bytes [0..1402]
@@ -664,7 +628,8 @@ Node — node/src/main.rs + node/src/cryptography/handshake.rs
 │   └── Return Some((session_key, finished_payload))
 │
 ├── RxAction::HandshakeComplete handling:                       [main.rs:987-1011]
-│   ├── send_fragmented_udp(sock, ..., finished, flags)         [main.rs:989-993]
+│   ├── send_fragmented_udp(..., finished, flags, seq,          [main.rs:989-993]
+│   │                        |frame| { sock.send(frame); })     ← closure-based emit
 │   │   └── 4 fragments (⌈4628/1402⌉)
 │   ├── NodeState::Established {                                [main.rs:998-1005]
 │   │   session_key,
@@ -736,7 +701,7 @@ Downstream (Hub → Node):
 Handshake Timeout (5s):                                         [main.rs:591-601 / 1033-1042]
   NodeState::Handshaking.started_ns + HANDSHAKE_TIMEOUT_NS exceeded
   → Re-send registration (FLAG_CONTROL)
-  → Assembler::new() (flush stale fragments)
+  → assembler.clear_all() (flush stale fragments, arena-based)
   → NodeState::Registering (restart from Step 0)
 
 Connection Timeout (30s, io_uring path only):                    [main.rs:782-786]
@@ -754,6 +719,46 @@ Rekey Trigger:                                                   [main.rs:177-18
   → Node: NodeState::Registering → full re-handshake (Step 0)
   → Hub: PeerSlot persists; new handshake overwrites session_key + cipher
   → Zero downtime: old cipher active until new Finished completes
+```
+
+---
+
+## V. Phase 0: Silicon Provisioning & Micro-Architecture Isolation
+
+### Target Flight Hardware: AMD/Xilinx K26 SOM (Hub & Node)
+
+**Silicon Geometry:** The Zynq UltraScale+ MPSoC possesses a **Quad-Core ARM Cortex-A53**.
+
+*   **Core 0:** Reserved for Linux Housekeeping (SMMU, VFS locks, SSH, unpinned hardIRQs).
+*   **Cores 1, 2, 3:** Physically isolated for M13's Net I/O, Datapath, and Crypto threads.
+*   **Memory:** 4GB total DDR4. We lock 512MB (`hugepages=256`) for the zero-copy Arenas.
+
+**Implementation (Yocto EDF / U-Boot):**
+Do not attempt to use `update-grub`. Append the kernel parameters via your Yocto `machine.conf`, Device Tree (`system-user.dtsi`), or dynamically at runtime via `extlinux.conf`.
+
+```bash
+# 1. Modify the U-Boot extlinux configuration on the K26 SOM
+sudo sed -i '/^[[:space:]]*append/ s/$/ isolcpus=1,2,3 rcu_nocbs=1,2,3 nohz_full=1,2,3 irqaffinity=0 hugepagesz=2M hugepages=256/' /boot/extlinux/extlinux.conf
+
+# 2. Sync filesystem and reboot to apply silicon isolation
+sync && sudo reboot
+
+```
+
+> **Verification Post-Reboot:**
+> 1. Verify CPU Isolation: `cat /sys/devices/system/cpu/isolated` → Must output exactly `1-3`.
+> 2. Verify HugePage allocation: `cat /proc/sys/vm/nr_hugepages` → Must output `256`.
+> *If either check fails, the pipeline will fall back to the CFS scheduler and the mission MUST be aborted.*
+> 
+
+### Build Dependencies (Run on K26 or Cross-Compile Host)
+
+```bash
+# Install Rust HFT Toolchain & Kernel 6.12+ Headers
+sudo apt update && sudo apt install -y curl build-essential clang llvm libbpf-dev pkg-config libelf-dev make linux-headers-$(uname -r)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup default stable && rustup update
+
 ```
 
 ---
@@ -853,7 +858,7 @@ Execution of this matrix guarantees the state machine is perfectly deterministic
 
 Validates the foundational mathematics and deterministic memory boundaries of the architecture in absolute isolation.
 
-* **Vector:** 80 strict deterministic tests executed via `cargo test` (33 Hub unit, 30 Hub integration, 17 Node unit).
+* **Vector:** 84 strict deterministic tests executed via `cargo test` (35 Hub unit, 30 integration via `tests/integration.rs`, 19 Node unit).
 * **Criteria:** Verifies VPP pipeline scatter/gather logic, Galois Field matrix inversions, AES-256-GCM AEAD bit-exactness, wire format parity, and Compile-Time Typestate transitions. Zero allocations permitted in the hot path during execution.
 
 ### Tier 2: Namespace Bounded Integration (NetNS E2E)

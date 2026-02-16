@@ -5,7 +5,8 @@ mod cryptography;
 mod network;
 
 use crate::engine::protocol::*;
-use crate::engine::protocol::{Assembler, FragHeader, FRAG_HDR_SIZE, send_fragmented_udp};
+use crate::engine::protocol::{Assembler, FragHeader, FRAG_HDR_SIZE, send_fragmented_udp,
+    alloc_asm_arena, ASM_SLOTS_PER_PEER};
 use crate::engine::runtime::{
     rdtsc_ns, calibrate_tsc,
     fatal, NodeState, HexdumpState};
@@ -203,25 +204,28 @@ fn process_rx_frame(
         let frag_data_len = unsafe { std::ptr::addr_of!(frag_hdr.frag_len).read_unaligned() } as usize;
         let frag_start = ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE;
         if frag_start + frag_data_len <= len {
-            if let Some(reassembled) = assembler.feed(
+            // Closure IoC: capture action as Option, set inside closure on completion
+            let mut action: Option<RxAction> = None;
+            let has_handshake = flags & FLAG_HANDSHAKE != 0;
+            assembler.feed(
                 frag_msg_id, frag_index, frag_total, frag_offset,
                 &buf[frag_start..frag_start + frag_data_len], now,
-            ) {
-                if flags & FLAG_HANDSHAKE != 0 {
-                    eprintln!("[M13-NODE] Reassembled handshake msg_id={} len={}",
-                        frag_msg_id, reassembled.len());
-                    if let Some((session_key, finished_payload)) = process_handshake_node(&reassembled, state) {
-                        return RxAction::HandshakeComplete { session_key, finished_payload };
-                    } else {
-                        return RxAction::HandshakeFailed;
-                    }
-                } else {
-                    if cfg!(debug_assertions) {
+                |reassembled| {
+                    if has_handshake {
+                        eprintln!("[M13-NODE] Reassembled handshake msg_id={} len={}",
+                            frag_msg_id, reassembled.len());
+                        if let Some((session_key, finished_payload)) = process_handshake_node(reassembled, state) {
+                            action = Some(RxAction::HandshakeComplete { session_key, finished_payload });
+                        } else {
+                            action = Some(RxAction::HandshakeFailed);
+                        }
+                    } else if cfg!(debug_assertions) {
                         eprintln!("[M13-NODE] Reassembled data msg_id={} len={}",
                             frag_msg_id, reassembled.len());
                     }
-                }
-            }
+                },
+            );
+            if let Some(a) = action { return a; }
         }
         return RxAction::Drop; // Fragment consumed (or partial)
     }
@@ -375,7 +379,8 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
     let mut tun_write_count: u64 = 0;
 
     let mut hexdump = HexdumpState::new(hexdump_mode);
-    let mut assembler = Assembler::new();
+    let asm_arena = alloc_asm_arena(ASM_SLOTS_PER_PEER);
+    let mut assembler = Assembler::init(asm_arena);
 
     let mut last_report_ns: u64 = rdtsc_ns(&cal);
     let mut last_keepalive_ns: u64 = 0;
@@ -539,14 +544,22 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                 }
                 RxAction::HandshakeComplete { session_key, finished_payload } => {
                     let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
-                    let frags = send_fragmented_udp(
-                        &sock, &src_mac, &hub_mac,
+                    // DEFECT β FIXED: Closure captures sock, hexdump, tx_count.
+                    let mut sent_frags = 0u64;
+                    send_fragmented_udp(
+                        &src_mac, &hub_mac,
                         &finished_payload, hs_flags,
-                        &mut seq_tx, &mut hexdump, &cal,
+                        &mut seq_tx,
+                        |frame| {
+                            hexdump.dump_tx(frame, now);
+                            let _ = sock.send(frame);
+                            tx_count += 1;
+                            sent_frags += 1;
+                        }
                     );
                     if cfg!(debug_assertions) {
                         eprintln!("[M13-NODE-PQC] Finished sent: {}B, {} fragments",
-                            finished_payload.len(), frags);
+                            finished_payload.len(), sent_frags);
                     }
 
                     state = NodeState::Established {
@@ -597,7 +610,7 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                 seq_tx += 1;
                 if sock.send(&reg).is_ok() { tx_count += 1; }
                 state = NodeState::Registering;
-                assembler = Assembler::new(); // Clear stale fragments
+                assembler.clear_all(); // DEFECT δ: preserve HugeTLB pointer
             }
         }
 
@@ -620,8 +633,9 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                 NodeState::Established { .. } => "Est",
                 NodeState::Disconnected => "Disc",
             };
-            eprintln!("[M13-N0] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{}",
-                rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, state_label);
+            eprintln!("[M13-N0] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{} Up:{}s",
+                rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, state_label,
+                match &state { NodeState::Established { established_ns, .. } => (now - established_ns) / 1_000_000_000, _ => (now - start_ns) / 1_000_000_000 });
             last_report_ns = now;
             gc_counter += 1;
             if gc_counter.is_multiple_of(5) { assembler.gc(now); }
@@ -689,8 +703,9 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
     if routes_installed {
         teardown_tunnel_routes(&hub_ip);
     }
-    eprintln!("[M13-N0] Shutdown. RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{}",
-        rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count);
+    let final_up_s = match &state { NodeState::Established { established_ns, .. } => (rdtsc_ns(&cal) - established_ns) / 1_000_000_000, _ => (rdtsc_ns(&cal) - start_ns) / 1_000_000_000 };
+    eprintln!("[M13-N0] Shutdown. RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} Up:{}s",
+        rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, final_up_s);
 }
 
 // ── io_uring SQPOLL Worker (R-02B: Zero-Syscall Datapath) ──────────────
@@ -747,7 +762,8 @@ fn run_uring_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, tun: Option<
     let mut tun_read_count: u64 = 0;
     let mut tun_write_count: u64 = 0;
     let mut hexdump = HexdumpState::new(hexdump_mode);
-    let mut assembler = Assembler::new();
+    let asm_arena = alloc_asm_arena(ASM_SLOTS_PER_PEER);
+    let mut assembler = Assembler::init(asm_arena);
     let mut last_report_ns: u64 = rdtsc_ns(&cal);
     let mut last_keepalive_ns: u64 = 0;
     let mut gc_counter: u64 = 0;
@@ -986,14 +1002,22 @@ fn run_uring_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, tun: Option<
                 }
                 RxAction::HandshakeComplete { session_key, finished_payload } => {
                     let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
-                    let frags = send_fragmented_udp(
-                        &sock, &src_mac, &hub_mac,
+                    // DEFECT β FIXED: Closure captures sock, hexdump, tx_count.
+                    let mut sent_frags = 0u64;
+                    send_fragmented_udp(
+                        &src_mac, &hub_mac,
                         &finished_payload, hs_flags,
-                        &mut seq_tx, &mut hexdump, &cal,
+                        &mut seq_tx,
+                        |frame| {
+                            hexdump.dump_tx(frame, now);
+                            let _ = sock.send(frame);
+                            tx_count += 1;
+                            sent_frags += 1;
+                        }
                     );
                     if cfg!(debug_assertions) {
                         eprintln!("[M13-NODE-PQC] Finished sent: {}B, {} fragments",
-                            finished_payload.len(), frags);
+                            finished_payload.len(), sent_frags);
                     }
                     state = NodeState::Established {
                         session_key,
@@ -1038,7 +1062,7 @@ fn run_uring_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, tun: Option<
                 seq_tx += 1;
                 if sock.send(&reg).is_ok() { tx_count += 1; }
                 state = NodeState::Registering;
-                assembler = Assembler::new();
+                assembler.clear_all(); // DEFECT δ: preserve HugeTLB pointer
             }
         }
 
@@ -1059,8 +1083,9 @@ fn run_uring_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, tun: Option<
                 NodeState::Established { .. } => "Est",
                 NodeState::Disconnected => "Disc",
             };
-            eprintln!("[M13-N0] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{}",
-                rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, state_label);
+            eprintln!("[M13-N0] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{} Up:{}s",
+                rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, state_label,
+                match &state { NodeState::Established { established_ns, .. } => (now - established_ns) / 1_000_000_000, _ => (now - start_ns) / 1_000_000_000 });
             last_report_ns = now;
             gc_counter += 1;
             if gc_counter.is_multiple_of(5) { assembler.gc(now); }
@@ -1074,6 +1099,7 @@ fn run_uring_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, tun: Option<
     if routes_installed {
         teardown_tunnel_routes(&hub_ip);
     }
-    eprintln!("[M13-N0] Shutdown. RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{}",
-        rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count);
+    let final_up_s = match &state { NodeState::Established { established_ns, .. } => (rdtsc_ns(&cal) - established_ns) / 1_000_000_000, _ => (rdtsc_ns(&cal) - start_ns) / 1_000_000_000 };
+    eprintln!("[M13-N0] Shutdown. RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} Up:{}s",
+        rx_count, tx_count, tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, final_up_s);
 }

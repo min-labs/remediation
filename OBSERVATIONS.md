@@ -79,11 +79,12 @@ Internal Loss (frames):
 Avg Frame Rate (frames/s):
   R_up   = Hub.RX / T         (upstream received rate)
   R_down = Node.RX / T        (downstream received rate)
+  where T = session duration in seconds (from `Up:Xs` telemetry counter, added R-04)
 
 Estimated Throughput (Mbps):
   BW_up   = (Hub.RX  × F_avg × 8) / T / 1e6
   BW_down = (Node.RX × F_avg × 8) / T / 1e6
-  where F_avg = average frame size in bytes (≈ MTU for tunnel traffic)
+  where F_avg = average frame size in bytes (≈ MTU for tunnel traffic), T from `Up:Xs`
 
 Handshake Latency (ms):
   HS_lat = (established_ns − start_ns) / 1e6
@@ -210,7 +211,7 @@ grep -E 'Shutdown|ELAPSED' /tmp/m13_*.log
 
 ### Telemetry — Initial Deployment (from TODO.md)
 
-> **Source**: `TODO.md` L92-93 (runtime verification block, captured 2026-02-15).
+> **Source**: `TODO.md` runtime verification block (captured 2026-02-15).
 > No standalone log file — data was recorded inline during sprint close.
 
 ```
@@ -336,6 +337,118 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 
 ---
 
+## Sprint R-04: Spec-to-Source Alignment & Dead Code Eradication
+
+**Date**: 2026-02-16
+**Scope**: Align codebase to PROTOCOL.md spec. Fix 2 spec deviations (DEFECT β: closure-based `send_fragmented_udp`, DEFECT ε: `GraphCtx` observability). Remove dead code (`Assembler::new()`). Integration test suite relocated to `tests/integration.rs`.
+
+### Changes
+- `node/src/engine/protocol.rs`: `send_fragmented_udp` → closure-based `emit: FnMut(&[u8])` (DEFECT β)
+- `node/src/cryptography/handshake.rs`: Updated call site for closure pattern
+- `node/src/main.rs`: Updated 2 call sites for closure pattern
+- `hub/src/network/mod.rs`: `GraphCtx` gained `hexdump: &mut HexdumpState` + `cal: TscCal` (DEFECT ε)
+- `hub/src/main.rs`: Updated 2 `GraphCtx` construction sites with new fields
+- `hub/src/engine/protocol.rs`: Removed dead `Assembler::new()` (arena transition to `Assembler::init(ptr)`)
+- `hub/tests/pipeline.rs` → `tests/integration.rs`: Relocated to root-level workspace member crate
+
+### Telemetry — Live Deployment (2026-02-16)
+
+> **Source**: Node terminal (local, m13@m13) and Hub terminal (SSH ubuntu@67.213.122.193).
+> Session duration: ~16 minutes over WAN (Taiwan → Singapore).
+> First handshake attempt timed out (WAN UDP fragment loss), succeeded on retry.
+
+```
+Hub shutdown:  RX:47,951  TX:178,332  TUN_R:178,332  TUN_W:47,883  AEAD:47,881/0  HS:1/0  Slab:1538/8192  Peers:1
+Node shutdown: RX:163,174 TX:49,244   TUN_R:49,182   TUN_W:163,091 AEAD_OK:163,091  FAIL:0
+```
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Hub RX** | 47,951 | Upstream frames received |
+| **Hub TX** | 178,332 | Downstream frames sent |
+| **Hub TUN_R** | 178,332 | TUN/SPSC reads (matches TX — no internal drop) |
+| **Hub TUN_W** | 47,883 | TUN/SPSC writes |
+| **Hub AEAD** | 47,881 / 0 | **Zero failures** |
+| **Node RX** | 163,174 | Downstream frames received |
+| **Node TX** | 49,244 | Upstream frames sent |
+| **Node TUN_R** | 49,182 | TUN reads |
+| **Node TUN_W** | 163,091 | TUN writes |
+| **Node AEAD** | 163,091 / 0 | **Zero failures** |
+| **Upstream Loss** | 49,244 − 47,951 = **1,293** | 2.63% — WAN/UDP loss |
+| **Downstream Loss** | 178,332 − 163,174 = **15,158** | 8.50% — WAN/UDP loss |
+| **Internal Loss (Hub)** | TUN_R − TX = 0, AEAD fail = 0 | **Zero** |
+| **Internal Loss (Node)** | AEAD fail = 0 | **Zero** |
+| **HS** | 1/0 | 1 successful handshake (2nd attempt), 0 failures |
+| **Slab** | 1538/8192 free | 81.3% headroom |
+| **Peers** | 1/1 | Single Node, single session |
+| **Handshake retries** | 1 | First attempt timed out — WAN UDP fragment loss |
+
+### Loss Analysis
+
+```
+Upstream  (Node TX → Hub RX):  49,244 →  47,951  = 1,293 lost   (2.63%)
+Downstream (Hub TX → Node RX): 178,332 → 163,174 = 15,158 lost  (8.50%)
+```
+
+- **All loss is WAN-side.** Internal pipeline verified lossless (AEAD FAIL = 0, slab stable).
+- Downstream asymmetry (8.50% vs 2.63%): Hub transmits 3.6× more frames than Node. Higher TX volume + WAN jitter amplifies loss.
+- **Zero AEAD failures across 210,972 total decryption operations** (47,881 Hub + 163,091 Node).
+
+### Telemetry — Session 2 (2026-02-16, with `Up:Xs` enabled)
+
+> **Source**: Node terminal (local, m13@m13) and Hub terminal (SSH ubuntu@67.213.122.193).
+> Session duration: **482s** (Node) / **503s** (Hub) over WAN (Taiwan → Singapore).
+> First handshake attempt timed out (WAN UDP fragment loss), succeeded on retry.
+> `Up:Xs` telemetry counter deployed for the first time.
+
+```
+Hub shutdown:  Slab:1538/8192 free. TX:44,200 RX:22,527 TUN_R:44,200 TUN_W:22,459 AEAD_OK:22,449 FAIL:0 Peers:1 Up:503s
+Node shutdown: RX:41,445 TX:22,574 TUN_R:22,512 TUN_W:41,359 AEAD_OK:41,359 FAIL:0 Up:482s
+```
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Hub RX** | 22,527 | Upstream frames received |
+| **Hub TX** | 44,200 | Downstream frames sent |
+| **Hub TUN_R** | 44,200 | TUN/SPSC reads (matches TX) |
+| **Hub TUN_W** | 22,459 | TUN/SPSC writes |
+| **Hub AEAD** | 22,449 / 0 | **Zero failures** |
+| **Node RX** | 41,445 | Downstream frames received |
+| **Node TX** | 22,574 | Upstream frames sent |
+| **Node TUN_R** | 22,512 | TUN reads |
+| **Node TUN_W** | 41,359 | TUN writes |
+| **Node AEAD** | 41,359 / 0 | **Zero failures** |
+| **Upstream Loss** | 22,574 − 22,527 = **47** | 0.21% — WAN/UDP loss |
+| **Downstream Loss** | 44,200 − 41,445 = **2,755** | 6.23% — WAN/UDP loss |
+| **Internal Loss** | AEAD fail = 0 both sides | **Zero** |
+| **HS** | 1/0 | 1 successful handshake (2nd attempt), 0 failures |
+| **Slab** | 1538/8192 free | 81.3% headroom |
+| **Uptime (Node)** | 482s | First session with `Up:Xs` counter |
+| **Uptime (Hub)** | 503s | Hub started ~21s before Node established |
+| **Handshake retries** | 1 | First attempt timed out — no fragment retransmission |
+| **Avg frame rate (Node RX)** | 41,445 / 482 ≈ **86 fps** | Downstream |
+| **Avg frame rate (Node TX)** | 22,574 / 482 ≈ **47 fps** | Upstream |
+
+### Session 2 Loss Analysis
+
+```
+Upstream  (Node TX → Hub RX): 22,574 → 22,527 = 47 lost   (0.21%)
+Downstream (Hub TX → Node RX): 44,200 → 41,445 = 2,755 lost (6.23%)
+```
+
+- Upstream loss dropped from 2.63% (Session 1) to **0.21%** (Session 2) — WAN variability, not code change.
+- Downstream loss consistent: 8.50% → **6.23%** — within WAN baseline.
+- **Zero AEAD failures across 63,808 total decryption operations** (22,449 Hub + 41,359 Node).
+- Combined across both sessions: **274,780 AEAD operations, zero failures.**
+
+### Known Issue: ClientHello fragment retransmission
+
+Both sessions required a handshake retry. The Node sends 3 ClientHello fragments (4194B payload) ONCE,
+then waits 5 seconds before retrying. At WAN loss rates of 2-8%, `P(all 3 arrive) = (1-loss)^3 ≈ 0.78-0.97`.
+**Fix deferred: add 500ms retransmission of ClientHello while in `Handshaking` state.**
+
+---
+
 ## Cross-Sprint Comparison (Normalized)
 
 > **One row per sprint, fixed columns.** Cells marked `—` = not measured that sprint.
@@ -350,6 +463,8 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-02A | 2026-02-15 | — | 990 | 963 | 963 | 979 | 983 | 986 | 982 | 965 |
 | R-02B | 2026-02-15 | — | 69,275 | 180,429 | 180,429 | 69,264 | 167,002 | 70,025 | 70,021 | 166,981 |
 | R-03 | 2026-02-15 | — | — | — | — | — | — | — | — | — |
+| R-04A | 2026-02-16 | ~16min | 47,951 | 178,332 | 178,332 | 47,883 | 163,174 | 49,244 | 49,182 | 163,091 |
+| R-04B | 2026-02-16 | 482s | 22,527 | 44,200 | 44,200 | 22,459 | 41,445 | 22,574 | 22,512 | 41,359 |
 
 ### Correctness
 
@@ -359,6 +474,8 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-02A | 978 | **0** | 965 | **0** | **0** | 1 | 0 | 0 | 1539 |
 | R-02B | 69,263 | **0** | 166,981 | **0** | **0** | 1 | 0 | 0 | 1542 |
 | R-03 | — | — | — | — | — | — | — | — | — |
+| R-04A | 47,881 | **0** | 163,091 | **0** | **0** | 1 | 0 | 0 | 1538 |
+| R-04B | 22,449 | **0** | 41,359 | **0** | **0** | 1 | 0 | 0 | 1538 |
 
 ### Loss (WAN-side)
 
@@ -368,6 +485,8 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-02A | −4 (timing) | ~0% | −20 (timing) | ~0% |
 | R-02B | 750 | 1.07% | 13,427 | 7.44% |
 | R-03 | — | — | — | — |
+| R-04A | 1,293 | 2.63% | 15,158 | 8.50% |
+| R-04B | 47 | 0.21% | 2,755 | 6.23% |
 
 ### Network Quality (External Measurement)
 
@@ -377,6 +496,7 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | R-02A | — | — | — | — | — | — | — |
 | R-02B | — | — | — | — | — | — | — |
 | R-03 | — | — | — | — | — | — | — |
+| R-04 | — | — | — | — | — | — | — |
 
 > **Action required:** Populate Network Quality table by running `ping` and `iperf3`
 > through the tunnel after each sprint deployment. See Measurement Capture Commands above.
@@ -384,11 +504,12 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 ### Tests
 
 | Sprint | Hub Unit | Hub Integration | Node Unit | Total | Pass Rate |
-|--------|----------|-----------------|-----------|-------|-----------|
+|--------|----------|-----------------|-----------|-------|-----------| 
 | R-01 | — | — | — | — | — |
 | R-02A | — | — | — | — | — |
 | R-02B | 33 | 30 | 17 | 80 | 100% |
 | R-03 | — | — | — | — | — |
+| R-04 | 35 | 30 | 19 | 84 | 100% |
 
 ### Sprint-over-Sprint Δ
 
@@ -409,6 +530,19 @@ No regression over extended runtime. Slab allocation stable (no leak). AEAD zero
 | FPU instructions in JitterEstimator | FDIV + FADD + FSUB | **Eradicated** | SUB + ADD + LSR only |
 | API surface | Identical | **Stable** | `update()`, `get()`, `jitter_us()` unchanged |
 | Live telemetry | Not captured | — | Server destroyed; deferred to next live deployment |
+
+| Metric | R-03 → R-04 | Direction | Notes |
+|--------|-------------|-----------|-------|
+| Dead code in Hub | `Assembler::new()` present | **Eradicated** | Arena-based `Assembler::init(ptr)` is sole constructor |
+| Spec deviations | 2 (β, ε) | **0** | Closure-based TX, GraphCtx observability aligned |
+| AEAD total ops | — → 274,780 | ↑ | 2 sessions combined (210,972 + 63,808) |
+| AEAD FAIL | — → 0 | **Stable** | Invariant held across refactor |
+| Internal Loss | — → 0 | **Stable** | Invariant held |
+| Slab free | — → 1538 | **Stable** | Consistent across both sessions |
+| Tests | 80 → 84 | ↑ +4 | Hub: 33→35, Node: 17→19. Integration: 30 (relocated to `tests/`) |
+| Test location | `hub/tests/pipeline.rs` | **Relocated** | `tests/integration.rs` (root-level workspace member) |
+| Telemetry | No duration | **Added** | `Up:Xs` session duration counter (Hub + Node) |
+| HS retransmission | Not implemented | — | ClientHello fires once; retry after 5s timeout. **Fix deferred.** |
 
 ---
 

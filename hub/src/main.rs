@@ -10,7 +10,8 @@ use m13_hub::engine::protocol::{
     PeerTable, PeerLifecycle, MAX_PEERS,
     produce_feedback_frame, RxBitmap, ReceiverState, FEEDBACK_INTERVAL_PKTS, FEEDBACK_RTT_DEFAULT_NS,
     Scheduler, TxCounter, TX_RING_SIZE, HW_FILL_MAX,
-    JitterBuffer, measure_epsilon_proc, JBUF_CAPACITY};
+    JitterBuffer, measure_epsilon_proc, JBUF_CAPACITY,
+    build_fragmented_raw_udp, build_fragmented_l2};
 use m13_hub::engine::runtime::{
     HexdumpState, run_monitor, Telemetry,
     TscCal, calibrate_tsc, rdtsc_ns, read_tsc,
@@ -536,13 +537,19 @@ fn process_fragment(
 
     if frag_data_start + frag_data_len <= frame_len {
         let frag_data = unsafe { std::slice::from_raw_parts(frame_ptr.add(frag_data_start), frag_data_len) };
-        if let Some(reassembled) = ctx.peers.assemblers[pidx].feed(
+        // DEFECT γ: Borrow-split — copy Assembler (it's Copy, holds raw ptr) to sever
+        // the mutable borrow on PeerTable. Closure captures `ctx` exclusively.
+        let mut asm = ctx.peers.assemblers[pidx];
+        let has_handshake = desc.flags & FLAG_HANDSHAKE != 0;
+        asm.feed(
             frag_msg_id, frag_index, frag_total, frag_offset, frag_data, ctx.now_ns,
-        ) {
-            if desc.flags & FLAG_HANDSHAKE != 0 && !reassembled.is_empty() {
-                process_handshake_message(&reassembled, pidx, ctx, stats);
-            }
-        }
+            |reassembled| {
+                if has_handshake && !reassembled.is_empty() {
+                    process_handshake_message(reassembled, pidx, ctx, stats);
+                }
+            },
+        );
+        ctx.peers.assemblers[pidx] = asm;
     }
     ctx.slab.free((desc.addr / ctx.frame_size as u64) as u32);
 }
@@ -569,46 +576,60 @@ fn process_handshake_message(
                 if ctx.peers.slots[pidx].addr.is_udp() {
                     let peer_ip = ctx.peers.slots[pidx].addr.ip().unwrap();
                     let peer_port = ctx.peers.slots[pidx].addr.port().unwrap();
-                    let frames = m13_hub::cryptography::handshake::build_fragmented_raw_udp(
-                        &ctx.src_mac, &ctx.gateway_mac, ctx.hub_ip, peer_ip,
-                        ctx.hub_port, peer_port, &server_hello, hs_flags,
+                    // DEFECT γ: Extract scalar fields to locals before closure capture
+                    let src_mac = ctx.src_mac;
+                    let gw_mac = ctx.gateway_mac;
+                    let hub_ip = ctx.hub_ip;
+                    let hub_port = ctx.hub_port;
+                    let umem_base = ctx.umem_base;
+                    let frame_size = ctx.frame_size as usize;
+                    build_fragmented_raw_udp(
+                        &src_mac, &gw_mac, hub_ip, peer_ip,
+                        hub_port, peer_port, &server_hello, hs_flags,
                         &mut hs_seq_tx, ctx.ip_id_counter,
+                        |frame_data, flen| {
+                            let now = rdtsc_ns(&ctx.cal);
+                            ctx.hexdump.dump_tx(frame_data.as_ptr(), flen as usize, now);
+
+                            if let Some(slab_idx) = ctx.slab.alloc() {
+                                let dst = unsafe { umem_base.add(slab_idx as usize * frame_size) };
+                                let copy_len = (flen as usize).min(frame_size);
+                                unsafe { std::ptr::copy_nonoverlapping(frame_data.as_ptr(), dst, copy_len); }
+                                ctx.scheduler.enqueue_critical(
+                                    (slab_idx as u64) * frame_size as u64, flen,
+                                );
+                            } else {
+                                eprintln!("[M13-DIAG] SLAB EXHAUSTION: ServerHello UDP frag. Slab: {}/{} free.",
+                                    ctx.slab.available(), 8192);
+                            }
+                        },
                     );
-                    let total_frags = frames.len();
-                    let mut enqueued = 0usize;
-                    for raw_frame in frames {
-                        if let Some(slab_idx) = ctx.slab.alloc() {
-                            let frame_ptr = unsafe { ctx.umem_base.add((slab_idx as usize) * ctx.frame_size as usize) };
-                            let flen = raw_frame.len().min(ctx.frame_size as usize);
-                            unsafe { std::ptr::copy_nonoverlapping(raw_frame.as_ptr(), frame_ptr, flen); }
-                            ctx.scheduler.enqueue_critical((slab_idx as u64) * ctx.frame_size as u64, flen as u32);
-                            enqueued += 1;
-                        } else {
-                            eprintln!("[M13-DIAG] SLAB EXHAUSTION: slab.alloc()=None during ServerHello UDP fragment. Slab: {}/{} free. Enqueued {}/{} fragments.",
-                                ctx.slab.available(), 8192, enqueued, total_frags);
-                        }
-                    }
                 } else {
-                    let peer_mac = &ctx.peers.slots[pidx].mac;
-                    let frames = m13_hub::cryptography::handshake::build_fragmented_l2(
-                        &ctx.src_mac, peer_mac,
+                    let peer_mac = ctx.peers.slots[pidx].mac;
+                    let src_mac = ctx.src_mac;
+                    let umem_base = ctx.umem_base;
+                    let frame_size = ctx.frame_size as usize;
+                    build_fragmented_l2(
+                        &src_mac, &peer_mac,
                         &server_hello, hs_flags,
                         &mut hs_seq_tx,
+                        |frame_data, flen| {
+                            let now = rdtsc_ns(&ctx.cal);
+                            ctx.hexdump.dump_tx(frame_data.as_ptr(), flen as usize, now);
+
+                            if let Some(slab_idx) = ctx.slab.alloc() {
+                                let dst = unsafe { umem_base.add(slab_idx as usize * frame_size) };
+                                let copy_len = (flen as usize).min(frame_size);
+                                unsafe { std::ptr::copy_nonoverlapping(frame_data.as_ptr(), dst, copy_len); }
+                                ctx.scheduler.enqueue_critical(
+                                    (slab_idx as u64) * frame_size as u64, flen,
+                                );
+                            } else {
+                                eprintln!("[M13-DIAG] SLAB EXHAUSTION: ServerHello L2 frag. Slab: {}/{} free.",
+                                    ctx.slab.available(), 8192);
+                            }
+                        },
                     );
-                    let total_frags = frames.len();
-                    let mut enqueued = 0usize;
-                    for raw_frame in frames {
-                        if let Some(slab_idx) = ctx.slab.alloc() {
-                            let frame_ptr = unsafe { ctx.umem_base.add((slab_idx as usize) * ctx.frame_size as usize) };
-                            let flen = raw_frame.len().min(ctx.frame_size as usize);
-                            unsafe { std::ptr::copy_nonoverlapping(raw_frame.as_ptr(), frame_ptr, flen); }
-                            ctx.scheduler.enqueue_critical((slab_idx as u64) * ctx.frame_size as u64, flen as u32);
-                            enqueued += 1;
-                        } else {
-                            eprintln!("[M13-DIAG] SLAB EXHAUSTION: slab.alloc()=None during ServerHello L2 fragment. Slab: {}/{} free. Enqueued {}/{} fragments.",
-                                ctx.slab.available(), 8192, enqueued, total_frags);
-                        }
-                    }
                 }
                 ctx.peers.hs_sidecar[pidx] = Some(hs);
                 ctx.peers.slots[pidx].seq_tx = hs_seq_tx;
@@ -963,7 +984,7 @@ fn worker_entry(
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let hexdump_enabled = std::env::var("M13_HEXDUMP").is_ok();
-    let _hexdump = HexdumpState::new(hexdump_enabled); // TODO: wire into TX path for packet-level diagnostics
+    let mut hexdump = HexdumpState::new(hexdump_enabled);
     let mut gc_counter: u64 = 0;
     let iface_mac = detect_mac(if_name);
     let src_mac = iface_mac;
@@ -997,6 +1018,7 @@ fn worker_entry(
     let mut aead_ok_count: u64 = 0;
     let mut aead_fail_count: u64 = 0;
     let mut last_hub_report_ns: u64 = 0;
+    let worker_start_ns: u64 = rdtsc_ns(&cal);
     for i in 0..SLAB_DEPTH {
         let fp = engine.get_frame_ptr(i as u32);
         // SAFETY: Pointer arithmetic within UMEM bounds; offset validated by kernel ring descriptor.
@@ -1109,6 +1131,9 @@ fn worker_entry(
                 rx_tun_cons: spsc_rx_tun_cons.as_mut(),
                 free_to_tun_prod: spsc_free_to_tun_prod.as_mut(),
                 free_to_dp_cons: spsc_free_to_dp_cons.as_mut(),
+                // DEFECT ε FIXED: Observability exports
+                hexdump: &mut hexdump,
+                cal,
             };
             let tx_count = execute_tx_graph(&mut tx_gctx);
             udp_tx_count += tx_count;
@@ -1123,13 +1148,14 @@ fn worker_entry(
             }
             let hs_ok = stats.handshake_ok.value.load(Ordering::Relaxed);
             let hs_fail = stats.handshake_fail.value.load(Ordering::Relaxed);
-            eprintln!("[M13-W{}] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{}",
+            eprintln!("[M13-W{}] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{} Up:{}s",
                 worker_idx, udp_rx_count, udp_tx_count,
                 tun_read_count, tun_write_count,
                 aead_ok_count, aead_fail_count,
                 hs_ok, hs_fail,
                 slab.available(), SLAB_DEPTH,
-                established, peers.count);
+                established, peers.count,
+                (now - worker_start_ns) / 1_000_000_000);
         }
 
         // === STAGE 0: ADAPTIVE BATCH DRAIN ===
@@ -1199,6 +1225,9 @@ fn worker_entry(
                     rx_tun_cons: spsc_rx_tun_cons.as_mut(),
                     free_to_tun_prod: spsc_free_to_tun_prod.as_mut(),
                     free_to_dp_cons: spsc_free_to_dp_cons.as_mut(),
+                    // DEFECT ε FIXED: Observability exports
+                    hexdump: &mut hexdump,
+                    cal,
                 };
 
                 let cycle = execute_graph(
@@ -1356,7 +1385,8 @@ fn worker_entry(
         slab.free((jbuf.entries[slot].addr / FRAME_SIZE as u64) as u32);
         jbuf.head += 1;
     }
-    eprintln!("[M13-W{}] Shutdown complete. Slab: {}/{} free. UDP TX:{} RX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} Peers:{}",
+    eprintln!("[M13-W{}] Shutdown complete. Slab: {}/{} free. UDP TX:{} RX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} Peers:{} Up:{}s",
         worker_idx, slab.available(), SLAB_DEPTH, udp_tx_count, udp_rx_count,
-        tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, peers.count);
+        tun_read_count, tun_write_count, aead_ok_count, aead_fail_count, peers.count,
+        (rdtsc_ns(&cal) - worker_start_ns) / 1_000_000_000);
 }

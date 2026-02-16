@@ -51,8 +51,17 @@ pub fn initiate_handshake(
     payload.extend_from_slice(&pk_dsa);
 
     let flags = FLAG_CONTROL | FLAG_HANDSHAKE;
-    let frags = send_fragmented_udp(sock, src_mac, dst_mac, &payload, flags, seq, hexdump, cal);
-    eprintln!("[M13-NODE-PQC] ClientHello sent: {}B payload, {} fragments", payload.len(), frags);
+    // DEFECT β FIXED: sock, hexdump, cal captured by closure environment.
+    let mut sent_frags = 0u64;
+    send_fragmented_udp(
+        src_mac, dst_mac, &payload, flags, seq,
+        |frame| {
+            let now = crate::engine::runtime::rdtsc_ns(cal);
+            hexdump.dump_tx(frame, now);
+            if sock.send(frame).is_ok() { sent_frags += 1; }
+        }
+    );
+    eprintln!("[M13-NODE-PQC] ClientHello sent: {}B payload, {} fragments", payload.len(), sent_frags);
 
     let dk_bytes = dk.as_bytes().to_vec();
 

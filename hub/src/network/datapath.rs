@@ -11,7 +11,7 @@
 use crate::network::{PacketVector, PacketDesc, Disposition, NextNode, GraphCtx, CycleStats, VECTOR_SIZE};
 use crate::engine::protocol::*;
 use crate::engine::protocol::{PeerAddr, MAX_PEERS};
-use crate::engine::protocol::Assembler;
+
 use crate::engine::runtime::prefetch_read_l1;
 
 // ============================================================================
@@ -54,7 +54,7 @@ pub fn rx_parse_raw(
         // SAFETY: Pointer arithmetic within UMEM bounds; offset validated by kernel ring descriptor.
         let ethertype = unsafe { u16::from_be(*(frame_ptr.add(12) as *const u16)) };
 
-        let (m13_offset, peer_idx) = if ethertype == ETH_P_M13.to_be() || ethertype == 0x88B5 {
+        let (m13_offset, peer_idx) = if ethertype == ETH_P_M13 {
             // L2 raw M13 (air-gapped WiFi 7)
             // SAFETY: Pointer arithmetic within UMEM bounds; offset validated by kernel ring descriptor.
             let peer_mac = unsafe { *(frame_ptr.add(6) as *const [u8; 6]) };
@@ -285,7 +285,7 @@ pub fn handle_reconnection(
             ctx.peers.slots[pidx].reset_session();
             ctx.peers.ciphers[pidx] = None;
             ctx.peers.hs_sidecar[pidx] = None;
-            ctx.peers.assemblers[pidx] = Assembler::new();
+            ctx.peers.assemblers[pidx].clear_all();
         }
     }
 }

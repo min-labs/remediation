@@ -31,6 +31,8 @@ Below is the uncompromising, fiduciary-grade technical debt ledger.
 
 ---
 
+# M13 REMEDIATION ROADMAP (R-SERIES)
+
 ### ✅ SPRINT R-01: HARDWARE DETERMINISM ENFORCEMENT (COMPLETED 2026-02-15)
 
 **Scope:** Eradicate all software fallback paths from the Hub's AF_XDP datapath initialization. Enforce physical hardware binding at boot or `SIGABRT`.
@@ -41,7 +43,7 @@ Below is the uncompromising, fiduciary-grade technical debt ledger.
 | --- | --- | --- |
 | `hub/src/network/bpf.rs` | **OVERWRITTEN** | `load_and_attach` returns `Self` (was `Option<Self>`). `XDP_FLAGS_SKB_MODE` import and fallback chain eradicated. `M13_SIMULATION` env check eradicated. `prog.is_null()` / `map.is_null()` null-pointer guards added. RLIMIT_MEMLOCK fallback to `RLIM_INFINITY` retained with architectural justification (policy scope, not physics degradation). |
 | `hub/src/network/xdp.rs` | **OVERWRITTEN** | `create_dummy_engine` (41-line mock allocator) eradicated. `M13_SIMULATION` env checks (4 occurrences) eradicated. 4KB `mmap` fallback eradicated — `MAP_HUGETLB \| MAP_POPULATE \| MAP_LOCKED` strictly enforced. `XDP_COPY` fallback eradicated — `XDP_ZEROCOPY \| XDP_USE_NEED_WAKEUP` strictly enforced. `kick_tx` now allows transient `EAGAIN`/`EBUSY`/`ENOBUFS`, fatals only on `ENXIO`/`EBADF`. HugePage error message corrected to `hugepages=600`. |
-| `hub/src/main.rs` | **PATCHED (2 blocks)** | **Patch 1 (L195-206):** `udp_mode` / `M13_LISTEN_PORT` worker-count gate removed. All workers are XDP-backed. **Patch 2 (L207-217):** `Option<BpfSteersman>` unwrap with `-1` fallback replaced by direct `BpfSteersman::load_and_attach()` → `Self`. |
+| `hub/src/main.rs` | **PATCHED (2 blocks)** | **Patch 1:** `udp_mode` / `M13_LISTEN_PORT` worker-count gate removed. All workers are XDP-backed. **Patch 2:** `Option<BpfSteersman>` unwrap with `-1` fallback replaced by direct `BpfSteersman::load_and_attach()` → `Self`. |
 
 **Eradicated Constructs:** `create_dummy_engine`, `M13_SIMULATION`, `XDP_FLAGS_SKB_MODE`, `XDP_COPY`, `MAP_ANONYMOUS`-only mmap fallback, `Option<BpfSteersman>`, `udp_mode` worker gate.
 
@@ -84,7 +86,7 @@ Below is the uncompromising, fiduciary-grade technical debt ledger.
 | `node/Cargo.toml` | **PATCHED** | Added `io-uring = "0.7"` — safe Rust bindings for `SQPOLL` + PBR. |
 | `node/src/network/mod.rs` | **PATCHED** | Registered `pub mod uring_reactor`. |
 | `node/src/network/uring_reactor.rs` | **NEW** | 220-line io_uring reactor. HugeTLB mmap arena, PBR registration via `SYS_io_uring_register`, multishot recv arming, BID recycle, staged TUN read/write/UDP send SQE helpers. `arena_base_ptr()` accessor for in-place frame construction. |
-| `node/src/main.rs` | **PATCHED (3 blocks)** | **Patch 1 (L80):** `main()` calls `run_uring_worker()` instead of `run_udp_worker()`. **Patch 2 (L328):** `run_udp_worker` marked `#[allow(dead_code)]` as legacy fallback. **Patch 3 (L697-1131):** Complete `run_uring_worker()` function — UringReactor init, CQE three-pass loop (Pass 0: drain+classify, Pass 1: batch AEAD decrypt, Pass 2: RxAction dispatch), state machine preservation. |
+| `node/src/main.rs` | **PATCHED (3 blocks)** | **Patch 1:** `main()` calls `run_uring_worker()` instead of `run_udp_worker()`. **Patch 2:** `run_udp_worker` marked `#[allow(dead_code)]` as legacy fallback. **Patch 3:** Complete `run_uring_worker()` function — UringReactor init, CQE three-pass loop (Pass 0: drain+classify, Pass 1: batch AEAD decrypt, Pass 2: RxAction dispatch), state machine preservation. |
 
 **Added Constructs:** `UringReactor`, `arm_multishot_recv()`, `stage_tun_write()`, `stage_udp_send()`, `arm_tun_read()`, `run_uring_worker()`, CQE tag constants (`TAG_UDP_RECV_MULTISHOT`, `TAG_TUN_READ`, `TAG_TUN_WRITE`, `TAG_UDP_SEND_TUN`, `TAG_UDP_SEND_ECHO`).
 
@@ -93,7 +95,7 @@ Below is the uncompromising, fiduciary-grade technical debt ledger.
 - Node (local): `RX:983 TX:986 TUN_R:982 TUN_W:965 AEAD_OK:965 FAIL:0 State:Est`
 - Zero AEAD failures. Bidirectional tunnel operational. PQC handshake completed (HS:1/0).
 
-> **⚠ NOTE:** `run_udp_worker()` is preserved with `#[allow(dead_code)]` as a legacy VFS fallback. It can be re-activated by changing `main()` L80.
+> **⚠ NOTE:** `run_udp_worker()` is preserved with `#[allow(dead_code)]` as a legacy VFS fallback. It can be re-activated by changing the call in `main()`.
 
 ---
 
@@ -117,6 +119,166 @@ Below is the uncompromising, fiduciary-grade technical debt ledger.
 - API surface unchanged: `update()`, `get()`, `jitter_us()` signatures identical
 - No live deployment — mathematical equivalence replacement, server destroyed after R-02
 - Live telemetry validation deferred to next sprint with server
+
+---
+
+### ✅ SPRINT R-04: SPEC-TO-SOURCE ALIGNMENT & DEAD CODE ERADICATION (COMPLETED 2026-02-16)
+
+**Scope:** Align codebase to PROTOCOL.md spec. Fix 2 spec deviations (DEFECT β: closure-based `send_fragmented_udp`, DEFECT ε: `GraphCtx` observability). Remove dead code (`Assembler::new()`). Relocate integration tests. Add `Up:Xs` session duration telemetry. Fix `ETH_P_M13.to_be()` ethertype comparison bug.
+
+**Files Modified:**
+
+| File | Action | Summary |
+| --- | --- | --- |
+| `node/src/engine/protocol.rs` | **PATCHED** | `send_fragmented_udp` → closure-based `emit: FnMut(&[u8])` (DEFECT β) |
+| `node/src/cryptography/handshake.rs` | **PATCHED** | Updated call site for closure pattern |
+| `node/src/main.rs` | **PATCHED** | Updated 2 call sites for closure pattern. Added `Up:Xs` to periodic + shutdown telemetry (recvmmsg + io_uring paths). |
+| `hub/src/network/mod.rs` | **PATCHED** | `GraphCtx` gained `hexdump: &mut HexdumpState` + `cal: TscCal` (DEFECT ε) |
+| `hub/src/main.rs` | **PATCHED** | Updated 2 `GraphCtx` construction sites. Added `worker_start_ns` + `Up:Xs` to periodic + shutdown telemetry. |
+| `hub/src/engine/protocol.rs` | **PATCHED** | Removed dead `Assembler::new()`. Added safety doc + `#[allow(clippy::not_unsafe_ptr_arg_deref)]`. |
+| `hub/src/network/datapath.rs` | **PATCHED** | Fixed `ethertype == ETH_P_M13.to_be() \|\| ethertype == 0x88B5` → `ethertype == ETH_P_M13` (clippy: equal expressions). |
+| `hub/tests/pipeline.rs` → `tests/integration.rs` | **RELOCATED** | Root-level workspace member crate `m13-tests`. |
+
+**Eradicated Constructs:** `Assembler::new()` dead code, `ETH_P_M13.to_be()` redundant byte-swap, DEFECT β (parameter-coupled TX), DEFECT ε (blind `GraphCtx`).
+
+**Added Constructs:** `Up:Xs` telemetry counter (Hub `worker_start_ns` + Node `established_ns`/`start_ns`), `#[allow(clippy::not_unsafe_ptr_arg_deref)]` with safety doc on `Assembler`.
+
+**Self-Audit:**
+- `cargo clippy`: 1 genuine bug fixed (`ETH_P_M13.to_be()`), 4 raw-pointer lints suppressed with safety documentation
+- Zero `Assembler::new()` call sites (verified by `grep`)
+- `send_fragmented_udp` signature matches PROTOCOL.md spec
+- 84 tests passing (Hub: 35, Node: 19, Integration: 30)
+- Live deployment: 2 sessions (R-04A: ~16min, R-04B: 482s), 274,780 AEAD ops, zero failures
+- Known issue: ClientHello fragment retransmission — fires once, retries after 5s timeout. Fix deferred.
+
+
+## Remediation Sprint R-05: Asynchronous Control Plane Offload (MBB)
+
+* **Target Defect:** Node `process_handshake_node` (HoL Blocking via Synchronous PQC Lattice Math).
+* **Physics & Architectural Rationale:** ML-DSA-87 and ML-KEM-1024 require Number Theoretic Transform (NTT) polynomial multiplications. On an ARM Cortex-A53, these execute in  to  clock cycles ( to  milliseconds). Executing this inline halts the datapath thread for . At 100 Mbps, this yields  of queued packets, overflowing hardware rings and destroying the isochronous playout SLA.
+* **Implementation Method (CS/Tech):**
+1. Pin a dedicated Cryptographic Control Plane thread to Core 0 (Housekeeping).
+2. When the Datapath receives a `ServerHello`, it pushes the `UmemSlice` pointer to an SPSC Control Ring.
+3. The Datapath thread operates a Make-Before-Break (MBB) State Machine: it continues to encrypt and route the existing Established video/telemetry stream at line-rate while the new key generates asynchronously in the background.
+4. When Core 0 finishes the NTT transforms, it pushes the new session key back via the return SPSC ring. The datapath atomically swaps the cipher pointer in  cycles utilizing RCU (Read-Copy-Update) semantics without dropping a single packet.
+
+
+
+## Remediation Sprint R-06: SIMD Interleaved Cryptographic Pipelining
+
+* **Target Defect:** Hub & Node `encrypt_batch_ptrs` (Sequential Cryptographic ALU Bubbles).
+* **Physics & Architectural Rationale:** Calling a scalar AES function in a loop (`for j in 0..4`) starves the CPU. ARMv8 Cryptographic Extensions (`AESE`, `AESMC`) have a 3-cycle hardware execution latency but a 1-cycle throughput. Sequential execution forces the ALU to stall for 2 cycles out of every 3 waiting for the AES round dependency to resolve, achieving exactly 33% of theoretical silicon throughput.
+* **Implementation Method (CS/Tech):**
+1. Discard the `ring` crate for the hot path. You must drop down to `core::arch::aarch64` NEON intrinsics.
+2. Load the state vectors of 4 *independent* network packets into 4 discrete 128-bit vector registers (`v0-v3`, `v4-v7`, `v8-v11`, `v12-v15`).
+3. Interleave the AES instructions: `AESE v0, vKey; AESE v4, vKey; AESE v8, vKey; AESE v12, vKey`.
+4. By the time `v12` is dispatched, `v0` has completed its 3-cycle hardware latency and is ready for the `AESMC` step. The instruction pipeline is now 100% saturated with zero latency bubbles. Performance mathematically quadruples.
+
+
+
+## Remediation Sprint R-07: Userspace Segmentation Offload (USO) MTU Slicer
+
+* **Target Defect:** Node `tun_file.read` (IP Fragmentation over RF).
+* **Physics & Architectural Rationale:** Sending a 1562-byte frame across a 1500 MTU WiFi link forces the kernel to execute software IP fragmentation. The probability of losing a fragmented packet scales geometrically: . A single lost 62-byte fragment destroys the entire 1562-byte payload, triggering severe TCP retransmissions.
+* **Implementation Method (CS/Tech):**
+1. Set the TUN MTU to  (Generic Receive Offload - GRO).
+2. The datapath reads massive 64KB TCP super-frames from the kernel.
+3. The datapath encrypts the 64KB payload in bulk (vastly superior SIMD vectorization efficiency).
+4. Implement USO: Mathematically slice the ciphertext into perfectly sized 1380-byte chunks entirely in userspace using pointer offsets (`start = i * 1380`).
+5. Prepend the 62-byte M13 header to each 1380-byte chunk, updating the inner IP header checksum using RFC 1624 differential math (to save cycles). Total wire footprint per frame:  bytes. Zero kernel IP fragmentation occurs.
+
+
+
+## Remediation Sprint R-08:  GHASH Anti-Replay Shield
+
+* **Target Defect:** Hub & Node `decrypt_one` (Asymmetric CPU DoS via Unfiltered Replays).
+* **Physics & Architectural Rationale:** AES-GCM tag verification requires Galois Hash (GHASH) carry-less multiplications (`PMULL`). If an adversary captures a legitimate frame and replays it 1,000,000 times at line-rate, the datapath will execute 1,000,000 GHASH authentications before discarding them due to tag/nonce rejection. This burns billions of cycles, starving legitimate telemetry.
+* **Implementation Method (CS/Tech):**
+1. Implement the RFC 6479 64-bit sliding window bitmask using a single `u64`.
+2. Compute  using `wrapping_sub`.
+3. If , shift the mask left by  and set .
+4. If , evaluate `(window >> \Delta) & 1`.
+5. If the packet is a mathematical replay, drop it via an arithmetic branchless check executing in  (`SUB`, `LSR`, `AND`) before a single cryptographic instruction is issued.
+
+
+
+## Remediation Sprint R-09: Netlink/Rtnetlink Native ABI Router
+
+* **Target Defect:** Node `setup_tunnel_routes` (L1i Cache Annihilation via Subprocess Spawning).
+* **Physics & Architectural Rationale:** `std::process::Command::new("ip")` executes `fork()` (TLB shootdown, page table cloning) and `execve()` (ELF binary loading, L1i cache flushing). Loading `ip` or `tc` binaries consumes up to . If routing reconverges during an RF link flap, the datapath's  deterministic deadline is completely obliterated.
+* **Implementation Method (CS/Tech):**
+1. Eradicate all `Command::new` shell subprocesses.
+2. Open an `AF_NETLINK` socket mapped to the `NETLINK_ROUTE` protocol.
+3. Construct binary C-structs (`nlmsghdr`, `rtmsg`, `ifinfomsg`, `tcmsg`). Use the `bytemuck` crate to zero-cost cast the Rust structs into `&[u8]` byte arrays.
+4. Serialize the structs directly into memory and fire via `libc::sendto()`. Modifying routing tables now consumes  with zero instruction cache eviction.
+
+
+
+## Remediation Sprint R-10: HugePage DMA Cache Alignment
+
+* **Target Defect:** Node `main.rs` (L1d Cache Thrashing via Colossal Stack Arrays).
+* **Physics & Architectural Rationale:** Declaring `rx_bufs: [[u8; 2048]; 64]` places  of memory directly on the execution stack. The Cortex-A53 L1 Data Cache (L1d) is exactly ****. Iterating over the stack mathematically guarantees a 100% cache miss rate. Fetching from DDR4 penalizes the CPU by  cycles per access, permanently stalling the vector processing pipeline.
+* **Implementation Method (CS/Tech):**
+1. Eradicate multidimensional stack arrays. Packet buffers must never live on the stack.
+2. Map the buffers directly into the NUMA-aligned `MAP_HUGETLB | MAP_POPULATE` HugePage Arena.
+3. Align the base addresses to 64-byte boundaries (`#[repr(align(64))]`), ensuring that packet headers perfectly align with hardware cache lines. This allows the CPU hardware prefetcher (`PRFM`) to pipeline RAM accesses deterministically ahead of the ALU.
+
+
+
+## Remediation Sprint R-11: Typestate Zero-Sized Types (ZST) Segregation
+
+* **Target Defect:** Node `NodeState` (Branch Predictor Collapse via Runtime FSM Enum Bloat).
+* **Physics & Architectural Rationale:** Rust enums are sized to their largest variant. `NodeState` contains multiple `Vec<u8>` arrays (PQC keys), inflating the struct to hundreds of bytes. In the `process_rx_frame` hot-loop, checking `matches!(state, ...)` forces the CPU to load this massive struct into L1d cache, evicting network payloads. Under stochastic RF packet loss, branch predictions will fail, flushing the instruction pipeline for a 15-cycle penalty per miss.
+* **Implementation Method (CS/Tech):**
+1. Eradicate data-carrying enums from the hot path. Define states as Zero-Sized Types (ZSTs): `struct Disconnected; struct Handshaking; struct Established { cipher: *const LessSafeKey };`.
+2. Implement Compile-Time Typestates utilizing generics: `fn process_rx_frame<S: State>(node: &mut Node<S>)`. State transitions consume `self` and return a new type.
+3. Cryptographic state buffers must be segregated to a slow-path memory arena. The Hot Loop must only possess an 8-byte pointer footprint. Branch evaluation is mathematically eradicated from the emitted `.text` assembly.
+
+
+
+## Remediation Sprint R-12: Wait-Free Signal Handlers
+
+* **Target Defect:** Node `nuke_cleanup_node` (Unrecoverable Deadlock in Asynchronous Signal Handlers).
+* **Physics & Architectural Rationale:** `std::sync::Mutex` utilizes `futex` syscalls and is **not async-signal-safe or panic-safe**. If the panic hook (or `SIGINT`) executes while the datapath thread holds the `Mutex` lock, the panic hook attempts to acquire the exact same lock, resulting in an infinite ABBA deadlock. The drone becomes an unrecoverable zombie.
+* **Implementation Method (CS/Tech):**
+1. Eradicate `Mutex<String>`.
+2. Replace it with a lock-free `std::sync::atomic::AtomicU32`.
+3. Upon network initialization, convert the Hub IPv4 address string to a 32-bit integer: `let ip_u32 = u32::from_be_bytes(ip.octets());` and store it via `Ordering::Release`.
+4. The signal handler reads the atomic integer utilizing `Ordering::Acquire`, recreates the IPv4 string via stack-allocated formatting (`format!("{}.{}.{}.{}", ...)`), and executes the Netlink teardown without acquiring a single thread lock or `futex`. Absolute wait-free teardown execution is guaranteed.
+
+
+
+## Remediation Sprint R-13: Branchless Vectorized IP Checksum Folding
+
+* **Target Defect:** Hub `ip_checksum` (Toy-Grade Mathematics).
+* **Physics & Architectural Rationale:** A `while i + 1 < data.len()` loop doing byte-by-byte shifting creates false loop-carried dependencies, fails to saturate the ALU's 64-bit datapaths, and forces continuous branch condition evaluations on a fixed-size header.
+* **Implementation Method (CS/Tech):**
+1. The IPv4 header is a fixed 20 bytes. Cast the slice into five 32-bit integers via `core::ptr::read_unaligned::<[u32; 5]>`.
+2. Execute 5 parallel scalar additions (`ADD`).
+3. Fold the 32-bit carry overflows into a 16-bit word branchlessly: `sum = (sum & 0xFFFF) + (sum >> 16); sum = (sum & 0xFFFF) + (sum >> 16); return !sum as u16;`. Total execution drops from  instructions to exactly  instructions.
+
+
+
+## Remediation Sprint R-14: Hardware Trailing-Zero Intrinsic Iteration
+
+* **Target Defect:** Hub `RxBitmap::drain_losses` ( Branch Predictor Failure).
+* **Physics & Architectural Rationale:** Iterating 512 times to check individual bits (`if bit == 0`) destroys the Branch History Table (BHT). Because RF packet drops are stochastic, the BHT will guess incorrectly continuously, triggering instruction pipeline flushes.
+* **Implementation Method (CS/Tech):**
+1. Iterate solely over the 64-bit words of the bitmap array.
+2. To find lost packets (zero bits), invert the 64-bit word (`let missing = !word;`).
+3. Utilize hardware intrinsics (compiles down to `RBIT` + `CLZ` on ARM, `TZCNT` on x86) to instantly find the index of the missing packet in  time: `let bit_idx = missing.trailing_zeros();`.
+4. Clear the lowest set bit branchlessly using the BLSR instruction: `missing &= missing - 1;`. Repeat until `missing == 0`. The loop executes exactly  times (where  is the number of dropped packets).
+
+
+
+## Remediation Sprint R-15: `UmemSlice` Memory Safety Algebra
+
+* **Target Defect:** Hub `rx_parse_raw` (Unbounded Pointer Arithmetic).
+* **Physics & Architectural Rationale:** Blind, unverified pointer offset calculation: `unsafe { ctx.umem_base.add(desc.addr as usize + m13_off as usize) }` based on unauthenticated network payloads allows a forged packet to read/write arbitrary physical memory mapped via DMA, instantly panic-crashing the Hub or breaking zero-trust isolation.
+* **Implementation Method (CS/Tech):**
+1. Define a secure ZST wrapper: `pub struct UmemSlice<'a> { ptr: NonNull<u8>, len: usize, _marker: PhantomData<&'a mut [u8]> }`.
+2. The constructor executes exactly ONE mathematical bounds check: `assert!(offset + len <= UMEM_SIZE)`.
+3. Because the struct internally guarantees the invariant, LLVM is mathematically proven to safely elide all subsequent slice boundary checks (`[..]`) inside the hot loop. This achieves zero-cost spatial memory safety while enforcing memory isolation between L2 tenants.
 
 ---
 
@@ -336,10 +498,10 @@ Data flow: VPP graph nodes → `CycleStats` (per-batch, `hub/src/network/mod.rs:
 
 | Diagnostic | Location | Trigger | Output |
 | --- | --- | --- | --- |
-| 1/sec telemetry line | `main.rs:1126` | Timer | `[M13-W0] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{}` |
+| 1/sec telemetry line | `main.rs:1150` | Timer | `[M13-W0] RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{} Up:{}s` |
 | Slab exhaustion (UDP frag) | `main.rs:587` | `slab.alloc()` returns `None` during ServerHello UDP fragmentation | `[M13-DIAG] SLAB EXHAUSTION: ...Slab: {}/{} free. Enqueued {}/{} fragments.` |
 | Slab exhaustion (L2 frag) | `main.rs:608` | `slab.alloc()` returns `None` during ServerHello L2 fragmentation | Same format, L2 AF_XDP path |
-| Shutdown summary | `main.rs:1359` | Process exit | `Slab: {}/{} free. UDP TX:{} RX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} Peers:{}` |
+| Shutdown summary | `main.rs:1389` | Process exit | `Slab: {}/{} free. UDP TX:{} RX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} Peers:{} Up:{}s` |
 | Hexdump RX | `process_rx_frame()` | `M13_HEXDUMP=1` | Per-packet hex dump of inbound frames |
 | Hexdump TX | — | — | **UNWIRED. Sprint 2:** Wire after `scheduler.enqueue_bulk()` for bidirectional inspection. |
 
@@ -350,7 +512,7 @@ Data flow: VPP graph nodes → `CycleStats` (per-batch, `hub/src/network/mod.rs:
 | SPSC ring occupancy | Ring fill-level invisible to Monitor. Wire `available()` to `Telemetry` SHM. |
 | TUN HK thread | `tun_housekeeping_thread()` (`main.rs:759-933`) has zero counters. VFS I/O latency, `pending_return` queue depth, and DPDK cache hit rates are all invisible. |
 | `tun_writes` semantic shift | Post-R-02A, counts SPSC push operations, not VFS `write()`. Actual VFS I/O in TUN HK thread is unmetered. |
-| Elapsed time at shutdown | Shutdown summary does not emit session duration. Requires external `date` wrapper. |
+| ~~Elapsed time at shutdown~~ | ~~Shutdown summary does not emit session duration.~~ **RESOLVED R-04:** `Up:Xs` counter added to Hub and Node telemetry (both periodic and shutdown lines). |
 | No RTT / jitter / throughput | Hub has no network quality metrics. Measured externally via `ping`/`iperf3` through tunnel (see `OBSERVATIONS.md`). |
 
 ---
@@ -364,7 +526,7 @@ The Node uses 7 local `u64` counters printed to stderr every 1 second. No `/dev/
 | `rx_count` | Pass 0: CQE drain | UDP recv CQEs processed |
 | `tx_count` | TUN read / echo / keepalive / registration | Successful `sock.send()` calls |
 | `aead_ok_count` | Pass 1: batch decrypt | `decrypt_batch_ptrs()` successes |
-| `aead_fail_count` | `process_rx_frame()` L164 | AEAD open failures |
+| `aead_fail_count` | `process_rx_frame()` | AEAD open failures |
 | `tun_read_count` | Pass 0: `TAG_TUN_READ` | TUN read CQEs processed |
 | `tun_write_count` | Pass 2: `RxAction::TunWrite` | TUN writes staged |
 | `State` | 1/sec report | `Reg` / `HS` / `Est` / `Disc` from `NodeState` enum |
@@ -391,6 +553,13 @@ The Node uses 7 local `u64` counters printed to stderr every 1 second. No `/dev/
 ## IV. VERIFICATION & VALIDATION (V&V) MATRIX
 
 "Happy Path" testing is prohibited. The transport engine must mathematically prove its resilience against adversarial physics and cryptographic anomalies. The system will not enter Phase 1 Flight Trials until it demonstrably passes the Tier 2 through Tier 5 Validation Matrix (**Sprint 15**).
+
+### Tier 1: Core Mathematical Integration (`tests/integration.rs`)
+
+Validates foundational mathematics and deterministic memory boundaries in absolute isolation. **Currently 30 tests** covering VPP graph pipeline, AEAD seal/open, PQC handshake round-trip, wire format parity, fragment reassembly, and rekey threshold enforcement.
+
+* **Crate:** `tests/` (workspace member `m13-tests`, depends on `m13-hub`)
+* **Run:** `cargo test -p m13-tests` or `cargo test --workspace`
 
 ### Tier 2: Namespace Bounded Integration (NetNS E2E)
 

@@ -97,7 +97,6 @@ fn build_encrypted_l2_frame(
     key: &ring::aead::LessSafeKey,
     payload_len: usize,
 ) -> (u64, u32, Vec<u8>) {
-    use ring::aead;
     let addr = frame_idx as u64 * MOCK_FRAME_SIZE as u64;
     let m13_off = ETH_HDR_SIZE;
     // Total: ETH(14) + M13(48) + payload
@@ -147,6 +146,8 @@ fn make_test_ctx<'a>(
     rx_bitmap: &'a mut RxBitmap,
     ip_id: &'a mut u16,
     umem: &'a mut Vec<u8>,
+    hexdump: &'a mut m13_hub::engine::runtime::HexdumpState,
+    cal: m13_hub::engine::runtime::TscCal,
 ) -> GraphCtx<'a> {
     GraphCtx {
         peers,
@@ -169,6 +170,8 @@ fn make_test_ctx<'a>(
         rx_tun_cons: None,
         free_to_tun_prod: None,
         free_to_dp_cons: None,
+        hexdump,
+        cal,
     }
 }
 
@@ -201,9 +204,12 @@ fn pipeline_valid_tunnel_packet_reaches_tun_write() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     // Parse
@@ -267,9 +273,12 @@ fn pipeline_runt_packet_dropped() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     let mut decrypt_vec = PacketVector::new();
@@ -294,9 +303,12 @@ fn pipeline_bad_magic_dropped() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     let mut decrypt_vec = PacketVector::new();
@@ -472,9 +484,12 @@ fn pipeline_batch_parse_multiple_packets() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     let mut decrypt_vec = PacketVector::new();
@@ -626,9 +641,12 @@ fn cross_path_node_frame_matches_hub_parser() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     let mut decrypt_vec = PacketVector::new();
@@ -642,7 +660,7 @@ fn cross_path_node_frame_matches_hub_parser() { run_with_large_stack(|| {
 })}
 
 // ============================================================================
-// TEST 12: ClientHello validation — hub rejects bad messages
+// TEST 16: ClientHello validation — hub rejects bad messages
 // ============================================================================
 
 #[test]
@@ -676,7 +694,7 @@ fn cross_path_client_hello_rejects_wrong_version() {
 }
 
 // ============================================================================
-// TEST 13: AEAD direction bytes — hub and node use complementary values
+// TEST 17: AEAD direction bytes — hub and node use complementary values
 // ============================================================================
 
 #[test]
@@ -704,7 +722,7 @@ fn cross_path_aead_direction_symmetry() {
 }
 
 // ============================================================================
-// TEST 14: FragHeader layout — hub and node agree on field positions
+// TEST 18: FragHeader layout — hub and node agree on field positions
 // ============================================================================
 
 #[test]
@@ -747,7 +765,7 @@ fn cross_path_frag_header_layout() {
 }
 
 // ============================================================================
-// TEST 15: Feedback frame wire size — behavioral (construct and measure)
+// TEST 19: Feedback frame wire size — behavioral (construct and measure)
 // ============================================================================
 
 #[test]
@@ -765,7 +783,7 @@ fn cross_path_feedback_frame_size() {
 }
 
 // ############################################################################
-// FULL PQC HANDSHAKE ROUND-TRIP: ClientHello → ServerHello → Finished
+// TEST 20: FULL PQC HANDSHAKE ROUND-TRIP: ClientHello → ServerHello → Finished
 // ############################################################################
 
 /// Full 3-message PQC handshake round-trip.
@@ -925,7 +943,7 @@ fn handshake_full_round_trip() {
 // ############################################################################
 
 // ============================================================================
-// TEST 18: Encrypted pipeline — correct key, full datapath
+// TEST 21: Encrypted pipeline — correct key, full datapath
 // ============================================================================
 
 /// Build an encrypted frame exactly as the node would, then feed it through
@@ -951,9 +969,12 @@ fn encrypted_pipeline_correct_key() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     // Step 1: Parse — frame must land in decrypt_out (crypto_ver=0x01 set by seal_frame)
@@ -1016,7 +1037,7 @@ fn encrypted_pipeline_correct_key() { run_with_large_stack(|| {
 })}
 
 // ============================================================================
-// TEST 19: Encrypted pipeline — wrong key rejection
+// TEST 22: Encrypted pipeline — wrong key rejection
 // ============================================================================
 
 /// Same encrypted frame as test 18, but hub has a DIFFERENT key installed.
@@ -1038,9 +1059,12 @@ fn encrypted_pipeline_wrong_key_rejected() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     let mut decrypt_vec = PacketVector::new();
@@ -1064,7 +1088,7 @@ fn encrypted_pipeline_wrong_key_rejected() { run_with_large_stack(|| {
 })}
 
 // ============================================================================
-// TEST 20: Encrypted pipeline — no cipher installed (peer has no session key)
+// TEST 23: Encrypted pipeline — no cipher installed (peer has no session key)
 // ============================================================================
 
 /// Peer is registered (lookup_or_insert succeeds) but no cipher key is set.
@@ -1086,9 +1110,12 @@ fn encrypted_pipeline_no_cipher_drops() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     let mut decrypt_vec = PacketVector::new();
@@ -1106,7 +1133,7 @@ fn encrypted_pipeline_no_cipher_drops() { run_with_large_stack(|| {
 })}
 
 // ============================================================================
-// TEST 21: Rekey threshold — frame_count triggers session reset
+// TEST 24: Rekey threshold — frame_count triggers session reset
 // ============================================================================
 
 /// Decrypt succeeds, but frame_count reaches REKEY_FRAME_LIMIT.
@@ -1129,9 +1156,12 @@ fn encrypted_pipeline_rekey_threshold() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     let mut decrypt_vec = PacketVector::new();
@@ -1171,7 +1201,7 @@ fn encrypted_pipeline_rekey_threshold() { run_with_large_stack(|| {
 // ############################################################################
 
 // ============================================================================
-// TEST 22: UDP-encapsulated encrypted pipeline — the real internet path
+// TEST 25: UDP-encapsulated encrypted pipeline — the real internet path
 // ============================================================================
 
 /// Build an IPv4+UDP-encapsulated L2 M13 frame (EtherType 0x0800), encrypt it,
@@ -1249,9 +1279,12 @@ fn encrypted_pipeline_udp_encapsulated() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     // Parse — must detect IPv4/UDP encapsulation and use m13_offset=56
@@ -1290,7 +1323,7 @@ fn encrypted_pipeline_udp_encapsulated() { run_with_large_stack(|| {
 })}
 
 // ============================================================================
-// TEST 23: Multi-peer concurrent decrypt — 4 peers in one batch
+// TEST 26: Multi-peer concurrent decrypt — 4 peers in one batch
 // ============================================================================
 
 /// Simulates 4 different nodes sending encrypted frames simultaneously.
@@ -1355,9 +1388,12 @@ fn encrypted_pipeline_multi_peer_concurrent() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     // Parse all 4 frames
@@ -1417,7 +1453,7 @@ fn encrypted_pipeline_multi_peer_concurrent() { run_with_large_stack(|| {
 })}
 
 // ============================================================================
-// TEST 24: TX encrypt pipeline — hub→node direction
+// TEST 27: TX encrypt pipeline — hub→node direction
 // ============================================================================
 
 /// Build a cleartext frame in UMEM (as tun_read_batch would), encrypt it via
@@ -1461,6 +1497,8 @@ fn tx_encrypt_pipeline_hub_to_node() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
 
     // Pre-register peer with cipher — must do before building PacketDesc
     let real_peer_idx = peers.lookup_or_insert(peer_addr, peer_mac).unwrap();
@@ -1483,6 +1521,7 @@ fn tx_encrypt_pipeline_hub_to_node() { run_with_large_stack(|| {
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     // Encrypt
@@ -1511,7 +1550,7 @@ fn tx_encrypt_pipeline_hub_to_node() { run_with_large_stack(|| {
 })}
 
 // ============================================================================
-// TEST 25: TX enqueue — RxBitmap + Scheduler integration
+// TEST 28: TX enqueue — RxBitmap + Scheduler integration
 // ============================================================================
 
 /// Feed packets through tx_enqueue_vector and verify that RxBitmap gets marked,
@@ -1525,9 +1564,12 @@ fn tx_enqueue_marks_bitmap_and_scheduler() { run_with_large_stack(|| {
     let mut rx_state = ReceiverState::new();
     let mut rx_bitmap = RxBitmap::new();
     let mut ip_id: u16 = 0;
+    let mut hexdump = m13_hub::engine::runtime::HexdumpState::new(false);
+    let cal = m13_hub::engine::runtime::TscCal::fallback();
     let mut ctx = make_test_ctx(
         &mut peers, &mut slab, &mut scheduler,
         &mut rx_state, &mut rx_bitmap, &mut ip_id, &mut umem,
+        &mut hexdump, cal,
     );
 
     // Build 3 PacketDescs with known seq_ids
@@ -1559,7 +1601,7 @@ fn tx_enqueue_marks_bitmap_and_scheduler() { run_with_large_stack(|| {
 })}
 
 // ============================================================================
-// TEST 26: Fragment reassembly — Assembler with real FragHeaders
+// TEST 29: Fragment reassembly — Assembler with real FragHeaders
 // ============================================================================
 
 /// Build 3 fragments of a message, feed them through the Assembler, and verify
@@ -1568,37 +1610,33 @@ fn tx_enqueue_marks_bitmap_and_scheduler() { run_with_large_stack(|| {
 #[test]
 fn fragment_reassembly_three_fragments() {
     let original_data = vec![0xABu8; 300]; // 300-byte message
-    let frag_size = 100;
 
-    let mut assembler = Assembler::new();
+    let arena = alloc_asm_arena(ASM_SLOTS_PER_PEER);
+    let mut assembler = Assembler::init(arena);
+    let mut reassembled = Vec::new();
 
     // Fragment 0: bytes [0..100]
-    let result0 = assembler.feed(
-        1,    // msg_id
-        0,    // index
-        3,    // total fragments
-        0,    // offset
-        &original_data[0..frag_size],
-        1_000_000_000, // timestamp
-    );
-    assert!(result0.is_none(), "Incomplete message must not reassemble");
+    assembler.feed(1, 0, 3, 0, &original_data[0..100], 1_000_000_000,
+        |data| reassembled.extend_from_slice(data));
+    assert!(reassembled.is_empty(), "Incomplete message must not reassemble");
 
     // Fragment 2 (out of order): bytes [200..300]
-    let result2 = assembler.feed(1, 2, 3, 200, &original_data[200..300], 1_000_000_001);
-    assert!(result2.is_none(), "Still incomplete after 2/3 fragments");
+    assembler.feed(1, 2, 3, 200, &original_data[200..300], 1_000_000_001,
+        |data| reassembled.extend_from_slice(data));
+    assert!(reassembled.is_empty(), "Still incomplete after 2/3 fragments");
 
     // Fragment 1 (final, out of order): bytes [100..200]
-    let result1 = assembler.feed(1, 1, 3, 100, &original_data[100..200], 1_000_000_002);
-    assert!(result1.is_some(), "Must reassemble after all 3 fragments received");
-
-    let reassembled = result1.unwrap();
+    assembler.feed(1, 1, 3, 100, &original_data[100..200], 1_000_000_002,
+        |data| reassembled.extend_from_slice(data));
     assert_eq!(reassembled.len(), 300, "Reassembled length must be 300");
     assert_eq!(&reassembled[..], &original_data[..],
         "Reassembled payload must match original byte-for-byte");
+
+    free_asm_arena(arena, ASM_SLOTS_PER_PEER);
 }
 
 // ============================================================================
-// TEST 27: RxBitmap — sliding window gap detection
+// TEST 30: RxBitmap — sliding window gap detection
 // ============================================================================
 
 /// Mark packets with gaps in the sequence, then drain losses.
@@ -1626,7 +1664,7 @@ fn rxbitmap_gap_detection() {
 }
 
 // ============================================================================
-// TEST 28: FIN flag — graceful close through full pipeline
+// TEST 31: FIN flag — graceful close through full pipeline
 // ============================================================================
 
 /// Build a FIN-flagged frame, run through classify, and verify it's recorded
