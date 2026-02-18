@@ -34,7 +34,8 @@ pub const UMEM_SIZE: usize = 1024 * 1024 * 1024; // 1 GB physically locked memor
 pub const FRAME_SIZE: u32 = 4096;
 pub const SO_BUSY_POLL: i32 = 46;
 pub const XDP_MMAP_OFFSETS: i32 = 1;
-pub const XDP_RING_NEED_WAKEUP: u32 = 1;
+
+
 
 pub const XDP_ZEROCOPY: u16 = 1 << 2;
 pub const XDP_USE_NEED_WAKEUP: u16 = 1 << 3;
@@ -60,18 +61,20 @@ impl TxPath for ZeroCopyTx {
     #[inline(always)] fn commit_tx(&mut self) { unsafe { self.tx.commit() } }
     #[inline(always)] fn kick_tx(&mut self) { 
         unsafe { 
-            if self.tx.needs_wakeup() { 
-                let res = sendto(self.sock_fd, ptr::null(), 0, MSG_DONTWAIT, ptr::null(), 0); 
-                if res < 0 {
-                    let e = *libc::__errno_location();
-                    // EAGAIN, EBUSY (driver ring full), and ENOBUFS are transient backpressure states.
-                    // The hardware will drain the queue by the next polling tick.
-                    // ENXIO (device gone) or EBADF (fd invalidated) are permanent physical severances.
-                    if e != libc::EAGAIN && e != libc::EBUSY && e != libc::ENOBUFS {
-                        fatal(E_XSK_BIND_FAIL, "kick_tx: Unrecoverable hardware error during DMA kick (ENXIO/EBADF).");
-                    }
+            // SURGICAL PATCH: Eradicate the conditional `if self.tx.needs_wakeup()`.
+            // Unconditionally flush the hardware TX ring via sendto() to mathematically
+            // guarantee transmission. Prevents VPP loop stranding when inline PQC stalls
+            // (10ms ML-KEM/ML-DSA) desynchronize the kernel's ring wakeup flag.
+            let res = sendto(self.sock_fd, ptr::null(), 0, MSG_DONTWAIT, ptr::null(), 0); 
+            if res < 0 {
+                let e = *libc::__errno_location();
+                // EAGAIN, EBUSY (driver ring full), and ENOBUFS are transient backpressure states.
+                // The hardware will drain the queue by the next polling tick.
+                // ENXIO (device gone) or EBADF (fd invalidated) are permanent physical severances.
+                if e != libc::EAGAIN && e != libc::EBUSY && e != libc::ENOBUFS {
+                    fatal(E_XSK_BIND_FAIL, "kick_tx: Unrecoverable hardware error during DMA kick (ENXIO/EBADF).");
                 }
-            } 
+            }
         } 
     }
 }
@@ -172,12 +175,9 @@ impl Engine<ZeroCopyTx> {
         if ret != 0 { fatal(E_XSK_BIND_FAIL, "getsockopt XDP_MMAP_OFFSETS failed. Kernel ABI mismatch."); }
 
         unsafe {
-            let tx_flags = (tx_def.producer as *mut u8).sub(offsets.tx.producer as usize).add(offsets.tx.flags as usize) as *mut u32;
-            let fq_flags = (fq_def.producer as *mut u8).sub(offsets.fr.producer as usize).add(offsets.fr.flags as usize) as *mut u32;
-            
-            let tx_strategy = ZeroCopyTx { tx: RingProd::new(&tx_def, tx_flags), sock_fd };
+            let tx_strategy = ZeroCopyTx { tx: RingProd::new(&tx_def), sock_fd };
             let rx_ring = RingCons::new(&rx_def);
-            let fq_ring = RingProd::new(&fq_def, fq_flags);
+            let fq_ring = RingProd::new(&fq_def);
             let cq_ring = RingCons::new(&cq_def);
             
             Engine { 
@@ -240,17 +240,17 @@ impl<T: TxPath> Drop for Engine<T> {
 // ============================================================================
 // RING OPERATIONS (Lock-free SPSC with explicit memory barriers)
 // ============================================================================
-struct RingProd { producer: *mut u32, consumer: *mut u32, ring: *mut c_void, flags: *mut u32, mask: u32, cached_cons: u32, local_prod: u32 }
+struct RingProd { producer: *mut u32, consumer: *mut u32, ring: *mut c_void, mask: u32, cached_cons: u32, local_prod: u32 }
 struct RingCons { producer: *mut u32, consumer: *mut u32, ring: *mut c_void, mask: u32 }
 
 impl RingProd {
-    unsafe fn new(r: *const xsk_ring_prod, flags: *mut u32) -> Self {
+    unsafe fn new(r: *const xsk_ring_prod) -> Self {
         let prod_ptr = (*r).producer as *mut AtomicU32;
         let init_prod = (*prod_ptr).load(Ordering::Relaxed);
-        RingProd { producer: (*r).producer, consumer: (*r).consumer, ring: (*r).ring, flags, mask: (*r).mask, cached_cons: 0, local_prod: init_prod }
+        RingProd { producer: (*r).producer, consumer: (*r).consumer, ring: (*r).ring, mask: (*r).mask, cached_cons: 0, local_prod: init_prod }
     }
     
-    #[inline(always)] unsafe fn needs_wakeup(&self) -> bool { ptr::read_volatile(self.flags) & XDP_RING_NEED_WAKEUP != 0 }
+
     
     #[inline(always)] unsafe fn available(&mut self) -> u32 {
         self.cached_cons = (*(self.consumer as *mut AtomicU32)).load(Ordering::Acquire);

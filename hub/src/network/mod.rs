@@ -8,6 +8,7 @@
 pub mod xdp;
 pub mod bpf;
 pub mod datapath;
+pub mod uso_pacer;
 
 use std::fmt;
 
@@ -88,6 +89,7 @@ impl PacketVector {
 pub enum NextNode {
     Drop = 0, AeadDecrypt = 1, ClassifyRoute = 2, TunWrite = 3,
     AeadEncrypt = 4, TxEnqueue = 5, Handshake = 6, Feedback = 7, Consumed = 8,
+    Echo = 9,
 }
 
 impl fmt::Display for NextNode {
@@ -102,6 +104,7 @@ impl fmt::Display for NextNode {
             NextNode::Handshake => write!(f, "handshake"),
             NextNode::Feedback => write!(f, "feedback"),
             NextNode::Consumed => write!(f, "consumed"),
+            NextNode::Echo => write!(f, "echo"),
         }
     }
 }
@@ -131,6 +134,7 @@ pub fn scatter(
     tun_out: &mut PacketVector, encrypt_out: &mut PacketVector,
     tx_out: &mut PacketVector, handshake_out: &mut PacketVector,
     feedback_out: &mut PacketVector, drop_out: &mut PacketVector,
+    cleartext_out: &mut PacketVector,
 ) {
     let n = src.len;
     let mut i = 0;
@@ -156,6 +160,7 @@ pub fn scatter(
                 NextNode::Handshake => { handshake_out.push(*desc); }
                 NextNode::Feedback => { feedback_out.push(*desc); }
                 NextNode::Drop => { drop_out.push(*desc); }
+                NextNode::Echo => { cleartext_out.push(*desc); }
                 NextNode::Consumed => {}
             }
         }
@@ -172,6 +177,7 @@ pub fn scatter(
             NextNode::Handshake => { handshake_out.push(*desc); }
             NextNode::Feedback => { feedback_out.push(*desc); }
             NextNode::Drop => { drop_out.push(*desc); }
+            NextNode::Echo => { cleartext_out.push(*desc); }
             NextNode::Consumed => {}
         }
         i += 1;
@@ -207,6 +213,13 @@ pub struct GraphCtx<'a> {
     // DEFECT ε FIXED: Observability exports for TX hexdump and TSC timing
     pub hexdump: &'a mut crate::engine::runtime::HexdumpState,
     pub cal: crate::engine::runtime::TscCal,
+    // V4: PQC offload via SPSC rings
+    pub pqc_req_tx: Option<&'a mut Producer<crate::cryptography::async_pqc::PqcReq>>,
+    pub pqc_resp_rx: Option<&'a mut Consumer<crate::cryptography::async_pqc::PqcResp>>,
+    // V4: Shared payload arena for zero-copy PQC offload (indexed by pidx)
+    pub payload_arena: *mut [u8; crate::cryptography::async_pqc::MAX_HS_PAYLOAD_SIZE],
+    // V4: EDT pacer (zero-spin, per-packet dynamic gap)
+    pub pacer: Option<&'a mut crate::network::uso_pacer::EdtPacer>,
 }
 
 #[derive(Default, Clone)]
@@ -232,4 +245,6 @@ pub struct CycleStats {
     pub handshake_ok: u64,
     pub handshake_fail: u64,
     pub direction_fail: u64,
+    // V4: PQC telemetry
+    pub pqc_drain: u64,
 }

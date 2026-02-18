@@ -172,6 +172,11 @@ fn make_test_ctx<'a>(
         free_to_dp_cons: None,
         hexdump,
         cal,
+        // V4: PQC offload + EDT pacer (not used in unit tests)
+        pqc_req_tx: None,
+        pqc_resp_rx: None,
+        payload_arena: std::ptr::null_mut(),
+        pacer: None,
     }
 }
 
@@ -245,12 +250,14 @@ fn pipeline_valid_tunnel_packet_reaches_tun_write() { run_with_large_stack(|| {
     let mut hs_out = PacketVector::new();
     let mut fb_out = PacketVector::new();
     let mut drop_out = PacketVector::new();
+    let mut echo_out = PacketVector::new();
     scatter(
         &all_packets, &disp,
         &mut dec_out, &mut cls_out,
         &mut tun_out, &mut enc_out,
         &mut tx_out, &mut hs_out,
         &mut fb_out, &mut drop_out,
+        &mut echo_out,
     );
 
     assert_eq!(tun_out.len, 1, "FLAG_TUNNEL packet should end up in TunWrite bin");
@@ -380,10 +387,12 @@ fn scatter_distributes_to_correct_bins() {
     let mut hs  = PacketVector::new();
     let mut fb  = PacketVector::new();
     let mut drp = PacketVector::new();
+    let mut echo = PacketVector::new();
     scatter(
         &pv, &disp,
         &mut dec, &mut cls, &mut tun, &mut enc,
         &mut tx, &mut hs, &mut fb, &mut drp,
+        &mut echo,
     );
 
     assert_eq!(tun.len, 1, "TunWrite packet should be in tun bin");
@@ -1022,9 +1031,11 @@ fn encrypted_pipeline_correct_key() { run_with_large_stack(|| {
     let mut hs  = PacketVector::new();
     let mut fb  = PacketVector::new();
     let mut drp = PacketVector::new();
+    let mut echo = PacketVector::new();
     scatter(&decrypt_vec, &classify_disp,
         &mut dec, &mut cls, &mut tun, &mut enc,
-        &mut tx, &mut hs, &mut fb, &mut drp);
+        &mut tx, &mut hs, &mut fb, &mut drp,
+        &mut echo);
     assert_eq!(tun.len, 1, "Decrypted tunnel packet must land in TunWrite bin");
     assert_eq!(drp.len, 0, "No packets should be dropped");
 

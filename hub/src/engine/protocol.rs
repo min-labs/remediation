@@ -32,7 +32,7 @@ pub const FLAG_FEEDBACK: u8  = 0x40;
 pub const FLAG_TUNNEL: u8    = 0x20;
 // FLAG_ECN (0x10) reserved for congestion signaling — not yet implemented
 pub const FLAG_FIN: u8       = 0x08;  // Graceful close signal
-// FLAG_FEC (0x04) reserved for RLNC — not yet implemented
+pub const FLAG_FEC: u8       = 0x04;  // RLNC forward error correction
 pub const FLAG_HANDSHAKE: u8 = 0x02;  // PQC handshake control
 pub const FLAG_FRAGMENT: u8  = 0x01;  // Fragmented message
 
@@ -217,15 +217,15 @@ impl Assembler {
         let slot_idx = ((msg_id ^ (msg_id >> 3)) & self.mask) as usize;
         let slot = unsafe { &mut *self.slots.add(slot_idx) };
 
-        // Slot collision handling: evict stale, reject active conflict
-        if slot.msg_id != msg_id {
+        // SURGICAL PATCH: If the slot is inactive, it unconditionally belongs to the incoming msg_id.
+        // This prevents the zero-initialized memory (msg_id=0) from rejecting the first ServerHello.
+        // Original code: `else if !slot.active { return; }` — drops msg_id=0 on boot.
+        if slot.msg_id != msg_id || !slot.active {
             if !slot.active || now_ns.saturating_sub(slot.first_rx_ns) > 5_000_000_000 {
                 slot.reset(msg_id, total, now_ns);
             } else {
                 return; // Active slot with different msg_id — skip
             }
-        } else if !slot.active {
-            return; // Inactive slot for this msg_id — already completed or GC'd
         }
 
         // Duplicate fragment guard
@@ -422,7 +422,6 @@ pub fn build_fragmented_l2<F>(
 }
 
 
-
 // ============================================================================
 // PEER TABLE — DPDK/VPP-style flat array with FNV-1a linear probing
 // ============================================================================
@@ -499,6 +498,7 @@ pub struct PeerSlot {
     pub frame_count: u64,
     pub established_rel_s: u32,
     pub mac: [u8; 6],
+    pub last_echo_ns: u64,
 }
 
 impl PeerSlot {
@@ -506,6 +506,7 @@ impl PeerSlot {
         addr: PeerAddr::EMPTY, lifecycle: PeerLifecycle::Empty,
         tunnel_ip_idx: 0, session_key: [0u8; 32], seq_tx: 0,
         frame_count: 0, established_rel_s: 0, mac: [0xFF; 6],
+        last_echo_ns: 0,
     };
     pub fn is_empty(&self) -> bool { self.lifecycle == PeerLifecycle::Empty }
     pub fn has_session(&self) -> bool { self.lifecycle == PeerLifecycle::Established }
@@ -613,6 +614,7 @@ impl PeerTable {
                 frame_count: 0,
                 established_rel_s: 0,
                 mac,
+                last_echo_ns: 0,
             };
             self.count += 1;
             Some(idx)
@@ -830,16 +832,19 @@ pub fn produce_feedback_frame(
 pub struct TxSubmit {
     pub frame_idx: u64,
     pub frame_len: u32,
+    pub release_ns: u64,  // V4: EDT release time (0 = immediate)
 }
 
 pub const TX_RING_SIZE: usize = 256;
 pub const HW_FILL_MAX: usize = 64;
 
-/// Strict-priority two-queue scheduler.
+/// Strict-priority two-queue scheduler with V4 EDT gating.
 /// Critical frames (handshakes, feedback) go first. Bulk data fills remaining capacity.
+/// Each entry carries a `release_ns` timestamp; `dequeue(now_ns)` won't release
+/// frames until the EDT horizon has passed.
 pub struct Scheduler {
-    critical: [(u64, u32); TX_RING_SIZE],
-    bulk:     [(u64, u32); TX_RING_SIZE],
+    critical: [(u64, u32, u64); TX_RING_SIZE],  // (frame_idx, len, release_ns)
+    bulk:     [(u64, u32, u64); TX_RING_SIZE],
     crit_head: usize,
     crit_tail: usize,
     bulk_head: usize,
@@ -849,42 +854,66 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new() -> Self {
         Scheduler {
-            critical: [(0, 0); TX_RING_SIZE],
-            bulk: [(0, 0); TX_RING_SIZE],
+            critical: [(0, 0, 0); TX_RING_SIZE],
+            bulk: [(0, 0, 0); TX_RING_SIZE],
             crit_head: 0, crit_tail: 0,
             bulk_head: 0, bulk_tail: 0,
         }
     }
 
+    /// V4: EDT-aware critical enqueue with explicit release time.
     #[inline(always)]
-    pub fn enqueue_critical(&mut self, idx: u64, len: u32) -> bool {
+    pub fn enqueue_critical_edt(&mut self, idx: u64, len: u32, release_ns: u64) -> bool {
         let next = (self.crit_tail + 1) % TX_RING_SIZE;
         if next == self.crit_head { return false; }
-        self.critical[self.crit_tail] = (idx, len);
+        self.critical[self.crit_tail] = (idx, len, release_ns);
         self.crit_tail = next;
         true
     }
 
+    /// Backward-compatible wrapper: critical enqueue with immediate release.
     #[inline(always)]
-    pub fn enqueue_bulk(&mut self, idx: u64, len: u32) -> bool {
+    pub fn enqueue_critical(&mut self, idx: u64, len: u32) -> bool {
+        self.enqueue_critical_edt(idx, len, 0)
+    }
+
+    /// V4: EDT-aware bulk enqueue.
+    #[inline(always)]
+    pub fn enqueue_bulk_edt(&mut self, idx: u64, len: u32, release_ns: u64) -> bool {
         let next = (self.bulk_tail + 1) % TX_RING_SIZE;
         if next == self.bulk_head { return false; }
-        self.bulk[self.bulk_tail] = (idx, len);
+        self.bulk[self.bulk_tail] = (idx, len, release_ns);
         self.bulk_tail = next;
         true
     }
 
+    /// Backward-compatible wrapper: bulk enqueue with immediate release.
     #[inline(always)]
-    pub fn dequeue(&mut self) -> Option<TxSubmit> {
+    pub fn enqueue_bulk(&mut self, idx: u64, len: u32) -> bool {
+        self.enqueue_bulk_edt(idx, len, 0)
+    }
+
+    /// V4: EDT-gated dequeue. Won't release frames before their `release_ns`.
+    /// Returns `None` if the queue is empty OR the head-of-line is not yet released.
+    #[inline(always)]
+    pub fn dequeue(&mut self, now_ns: u64) -> Option<TxSubmit> {
         if self.crit_head != self.crit_tail {
-            let (idx, len) = self.critical[self.crit_head];
-            self.crit_head = (self.crit_head + 1) % TX_RING_SIZE;
-            return Some(TxSubmit { frame_idx: idx, frame_len: len });
+            let (idx, len, release_ns) = self.critical[self.crit_head];
+            if release_ns > 0 && now_ns < release_ns {
+                // Head-of-line blocking: critical frame not yet released.
+                // Fall through to check bulk queue (which may have ready frames).
+            } else {
+                self.crit_head = (self.crit_head + 1) % TX_RING_SIZE;
+                return Some(TxSubmit { frame_idx: idx, frame_len: len, release_ns });
+            }
         }
         if self.bulk_head != self.bulk_tail {
-            let (idx, len) = self.bulk[self.bulk_head];
+            let (idx, len, release_ns) = self.bulk[self.bulk_head];
+            if release_ns > 0 && now_ns < release_ns {
+                return None;  // Bulk head-of-line also blocked
+            }
             self.bulk_head = (self.bulk_head + 1) % TX_RING_SIZE;
-            return Some(TxSubmit { frame_idx: idx, frame_len: len });
+            return Some(TxSubmit { frame_idx: idx, frame_len: len, release_ns });
         }
         None
     }
@@ -897,12 +926,11 @@ impl Scheduler {
         c + b
     }
 
-    /// Drain scheduler queues into AF_XDP TX ring.
-    /// Dequeues up to `max_burst` frames, stages them on `tx_path`, then kicks.
-    pub fn schedule<T: crate::network::xdp::TxPath>(&mut self, tx_path: &mut T, tx_counter: &TxCounter, max_burst: usize) {
+    /// V4: EDT-aware schedule. Passes `now_ns` to dequeue for release gating.
+    pub fn schedule<T: crate::network::xdp::TxPath>(&mut self, tx_path: &mut T, tx_counter: &TxCounter, max_burst: usize, now_ns: u64) {
         let mut count = 0usize;
         while count < max_burst {
-            if let Some(submit) = self.dequeue() {
+            if let Some(submit) = self.dequeue(now_ns) {
                 tx_path.stage_tx_addr(submit.frame_idx, submit.frame_len);
                 tx_counter.value.fetch_add(1, Ordering::Relaxed);
                 count += 1;

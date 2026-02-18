@@ -345,7 +345,7 @@ mod tests {
         let original = frame[62..126].to_vec();
 
         let flen = frame.len();
-        let mut ptrs = [frame.as_mut_ptr()];
+        let ptrs = [frame.as_mut_ptr()];
         let lens = [flen];
         encrypt_batch_ptrs(&ptrs, &lens, 1, &key, 0x01, 42);
 

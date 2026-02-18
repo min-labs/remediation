@@ -107,8 +107,8 @@ pub fn clock_ns() -> u64 {
 pub struct TscCal {
     tsc_base: u64,
     mono_base: u64,
-    mult: u32,
-    shift: u32,
+    pub(crate) mult: u32,
+    pub(crate) shift: u32,
     valid: bool,
 }
 

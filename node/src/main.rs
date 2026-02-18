@@ -142,7 +142,7 @@ fn process_rx_frame(
     }
 
     // Initial flags (may be ciphertext — will re-read after decrypt)
-    let _flags_pre = m13.flags;
+    let flags_pre = m13.flags;
 
     // Pre-decrypted by batch AEAD — skip both decrypt and cleartext-reject.
     // PRE_DECRYPTED_MARKER (0x02) is stamped by decrypt_batch_ptrs on success.
@@ -153,8 +153,8 @@ fn process_rx_frame(
         // Exempt: handshakes, fragments, and control frames (FIN/keepalive)
         if matches!(state, NodeState::Established { .. })
            && buf[ETH_HDR_SIZE + 2] != 0x01
-           && _flags_pre & FLAG_HANDSHAKE == 0 && _flags_pre & FLAG_FRAGMENT == 0
-           && _flags_pre & FLAG_CONTROL == 0 {
+           && flags_pre & FLAG_HANDSHAKE == 0 && flags_pre & FLAG_FRAGMENT == 0
+           && flags_pre & FLAG_CONTROL == 0 {
             return RxAction::Drop; // drop cleartext data frame
         }
 
@@ -601,16 +601,28 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
             }
         }
 
-        if let NodeState::Handshaking { started_ns, .. } = &state {
-            if now.saturating_sub(*started_ns) > HANDSHAKE_TIMEOUT_NS {
-                eprintln!("[M13-NODE-PQC] Handshake timeout ({}s). Retrying...",
-                    HANDSHAKE_TIMEOUT_NS / 1_000_000_000);
-                // Recovery: re-send registration and go back to Registering
-                let reg = build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL);
-                seq_tx += 1;
-                if sock.send(&reg).is_ok() { tx_count += 1; }
-                state = NodeState::Registering;
-                assembler.clear_all(); // DEFECT δ: preserve HugeTLB pointer
+        if let NodeState::Handshaking { ref mut started_ns, ref client_hello_bytes, .. } = state {
+            // SURGICAL PATCH: Replace 5-second constant with 250ms Micro-ARQ boundary.
+            // Eradicates the 5-second dead-trap and ensures rapid retransmission.
+            if now.saturating_sub(*started_ns) > HANDSHAKE_RETX_INTERVAL_NS {
+                eprintln!("[M13-NODE-PQC] Handshake micro-timeout (250ms). Retransmitting...");
+
+                let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
+                let mut seq_cap = seq_tx;
+
+                send_fragmented_udp(
+                    &src_mac, &hub_mac,
+                    client_hello_bytes, hs_flags,
+                    &mut seq_cap,
+                    |frame| {
+                        hexdump.dump_tx(frame, now);
+                        let _ = sock.send(frame);
+                        tx_count += 1;
+                    }
+                );
+
+                seq_tx = seq_cap;
+                *started_ns = now; // Reset timer without recomputing NTT math
             }
         }
 
@@ -1055,14 +1067,29 @@ fn run_uring_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, tun: Option<
         }
 
         // ── Handshake timeout ──────────────────────────────────
-        if let NodeState::Handshaking { started_ns, .. } = &state {
-            if now.saturating_sub(*started_ns) > HANDSHAKE_TIMEOUT_NS {
-                eprintln!("[M13-NODE-PQC] Handshake timeout. Retrying...");
-                let reg = build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL);
-                seq_tx += 1;
-                if sock.send(&reg).is_ok() { tx_count += 1; }
-                state = NodeState::Registering;
-                assembler.clear_all(); // DEFECT δ: preserve HugeTLB pointer
+        if let NodeState::Handshaking { ref mut started_ns, ref client_hello_bytes, .. } = state {
+            // SURGICAL PATCH: Replace 5-second constant with 250ms Micro-ARQ boundary.
+            // Eradicates the 5-second dead-trap and ensures rapid retransmission.
+            if now.saturating_sub(*started_ns) > HANDSHAKE_RETX_INTERVAL_NS {
+                eprintln!("[M13-NODE-PQC] Handshake micro-timeout (250ms). Retransmitting...");
+
+                let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
+                let mut seq_cap = seq_tx;
+
+                // Closure IoC execution prevents borrow checker collision
+                send_fragmented_udp(
+                    &src_mac, &hub_mac,
+                    client_hello_bytes, hs_flags,
+                    &mut seq_cap,
+                    |frame| {
+                        hexdump.dump_tx(frame, now);
+                        let _ = sock.send(frame);
+                        tx_count += 1;
+                    }
+                );
+
+                seq_tx = seq_cap;
+                *started_ns = now; // Reset timer without recomputing 10ms of NTT math
             }
         }
 

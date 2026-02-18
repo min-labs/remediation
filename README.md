@@ -6,94 +6,130 @@
 **Operating System:** AMD Embedded Development Framework (EDF) Yocto Project (Scarthgap 5.0 LTS) / **Linux Kernel 6.12 LTS+**  
 > **ARCHITECTURAL MANDATE:** Legacy PetaLinux distributions are explicitly End-of-Life (EOL) and physically incompatible with the M13 datapath. Kernel 6.12+ is a hard architectural requirement to enable `io_uring` Provided Buffer Rings (PBR), `IORING_RECV_MULTISHOT`, and advanced `XDP_REDIRECT` primitives.
 
+## §1. End-State System Topology
 
+> [!NOTE]
+> This section describes M13's **end-state architecture** — the fully realized system as designed. Individual subsystems are at varying stages of implementation; see `TODO.md` for current sprint status and the roadmap.
 
-## I. System Topology
+M13 is a Beyond Visual Line of Sight (BVLOS) drone swarm operation design with a hub-nodes topology.
 
-M13 is a hardware-accelerated control and transport architecture engineered specifically for Beyond Visual Line of Sight (BVLOS) drone operations. It establishes a contiguous, end-to-end datapath between WAN-deprived tactical drone swarms and remote command centers by tightly coupling a localized WiFi 7 fronthaul with a bonded, multipath SATCOM backhaul. 
+* **Hub (LALE Drone):** The Hub functions as a "flying telco" (Airborne Network Gateway), aggregating heterogeneous, asymmetric satellite uplinks (e.g., Starlink, Amazon Kuiper, Eutelsat) into a bonded, multipath-scheduled backhaul and broadcasting a WiFi 7 Access Point (AP) for the daughter drone swarm.
 
-M13 executes entirely via kernel-bypass (`AF_XDP` and `io_uring`) on isolated CPU cores to strip all Virtual File System (VFS) overhead and provide a deterministic, line-rate transport pipeline. By enforcing zero-trust physical isolation and Post-Quantum Cryptographic (PQC) payload encapsulation, the system guarantees bounded-latency command execution and isochronous telemetry survival in heavily contested RF environments.
+* **Nodes (WAN-deprived Daughter Drone Swarm):** Tactical drones without inherent Wide Area Network (WAN) hardware interfaces. Nodes associate with the Hub's WiFi 7 AP, achieving end-to-end connectivity to the User exclusively via the M13 L3 encrypted tunnel over the local WLAN.
 
-* **Hub (LALE Drone):** This module aggregates heterogeneous, asymmetric satellite uplinks (e.g., Starlink, Amazon Kuiper, Eutelsat) into a bonded, multipath-scheduled backhaul. It functions as a “flying telco” that broadcasts a WiFi 7 Access Point (AP) for the localized daughter drones. The Hub executes `AF_XDP` zero-copy packet processing, BBRv3 congestion pacing, and eBPF token buckets at hardware line-rate.
-* **Nodes (WAN-deprived Daughter Drone Swarm):** This module comprises of tactical drone swarm lacking inherent Wide Area Network (WAN) hardware interfaces. The Nodes associate with the Hub's WiFi 7 AP, achieving end-to-end connectivity to the User exclusively via the M13 L3 encrypted tunnel over the local WLAN. To bypass VFS overhead in the absence of `AF_XDP` support over `mac80211`, the Node utilizes an `IORING_SETUP_SQPOLL`-configured `io_uring` Multishot ingest, mapping the buffer to a HugePage Arena.
-* **User (Command Center):** This constitutes the remote infrastructure connected via a standard Internet Service Provider (ISP). M13 operates strictly at the transport layer, acting as a transparent, opaque IP tunnel that remains entirely agnostic to the L7 application protocols (MAVLink/Video) executing above it.
+* **User (Command Center):** The user controls both the Hub and the daughter drone swarm via remote infrastructure connected to an Internet Service Provider (ISP). M13 operates strictly at the transport layer, acting as a transparent, opaque IP tunnel entirely agnostic to the L7 application protocols (MAVLink/Video) executing above it.
+
+The value of M13 is not any single component in isolation — it is the integrated system competing directly against Silvus StreamCaster (~$15K–$30K/node), Persistent Systems MPU5 (~$30K–$35K/node), L3Harris AN/PRC-163 MANET (~$39K/radio), and MIDS-JTRS Link 16 terminals (~$186K–$263K/terminal) for BVLOS drone **swarm** command and control. These incumbents are proven, combat-deployed systems — but they are priced for defense prime procurement, not for scalable swarm deployment where every daughter drone in the formation requires a node. Critically, M13 is both the drone and the network — the incumbents above are network radios only, bolted onto someone else's airframe. M13 targets a per-node cost at a fraction of these price points (target: TBD), making swarm-scale BVLOS architectures economically viable for the first time outside of nation-state budgets.
+
+Furthermore, this price-point disproportion means M13 is not domain-locked. It is a multi-usage hub-swarm design: 
+- **search and rescue**, where every minute matters — a swarm of drones mapping the area comprehensively in a fraction of the time a single aircraft could; 
+- **disaster connectivity**, such as floods or earthquakes that destroy ground telco infrastructure — M13 deploys as an airborne mesh providing emergency internet to affected users, enabling them to report their location and coordinate rescue; 
+- **humanitarian logistics**, where daughter drones deliver food, water, heating, or basic medical supplies to stranded populations until ground-based rescue arrives; 
+- **infrastructure inspection**, where swarms survey pipelines, power grids, or coastline at scale. 
+
+Across all of these, the daughter drones are attritable and the per-node price point is low enough to enable multi-strategy deployment within a single mission. A LALE mothership Hub holds station at altitude for an extended period to provide persistent SATCOM backhaul; *x* daughter Nodes hold stagnant positions to monitor specific areas of interest; *y* daughter Nodes patrol in continuous movement patterns — together, this covers maximum area with minimal line-of-sight gaps. When a worker drone's battery runs low, a fresh drone deploys from the origin and seamlessly joins the mesh — the spent drone returns to base. This rotation model turns endurance from a single-drone engineering problem into a logistics problem solved by quantity: continuous coverage with no downtime, at a cost where losing a Node to weather, attrition, or terrain is an acceptable operational expense rather than a mission-ending loss.
+
+The incumbents are priced out of all of these. M13 makes it possible.
+
+## §2. System Specification
+
+M13's design targets bounded-latency transport over contested RF through kernel-bypass I/O, post-quantum encryption, adaptive FEC, and COTS hardware designed for attrition-tolerant swarm deployment. The Hub runs dual kernel-bypass paths: `AF_XDP` zero-copy on the WAN-facing satellite interfaces and `io_uring` on the WiFi 7 AP interface (since `mac80211` does not support `AF_XDP`). Nodes run `io_uring` exclusively. Both run on isolated CPU cores with PQC payload encapsulation.
+
+Implementation status by layer:
+
+| Layer | Implemented | Remaining |
+|-------|-------------|-----------|
+| **Cryptography** | PQC ✅ + AES-256-GCM ✅ + Async offload ✅ | Anti-replay ❌ (S7.4) |
+| **Engine** | VPP ✅ + SPSC ✅ + HugePage ✅ + EDT ✅ | RL-AFEC ❌ (S3) + BBRv3 ❌ (S5.3) |
+| **Network** | AF_XDP ✅ + io_uring ✅ + eBPF ✅ + USO ✅ | RSS ❌ (S5.5) + Multipath SATCOM ❌ (S5.6) |
+| **Firmware** | | FPGA PL offload ❌ (S9) |
+| **Hardware** | | LALE-ANG ❌ (S11) / ADDS ❌ (S11) / Custom PCB ❌ (S11) |
+
+> [!NOTE]
+> See `TODO.md` for detailed sprint status, implementation priorities, and the full roadmap.
 
 ### Data Flow Physics
 
 **Commands (Downstream - Low Latency, Strict Priority):**
 ```text
-User PC ──Fiber──→ ISP ──Fiber──→ Satellite Constellation ──→ Hub (AF_XDP) ──WiFi 7──→ Node (io_uring)
-
+User PC ──Fiber──→ ISP ──Fiber──→ Satellite Constellation ──→ Hub [AF_XDP WAN │ WiFi AP io_uring] ──WiFi 7──→ Node (io_uring)
 ```
 
 **Telemetry/Video (Upstream - High Throughput, Isochronous):**
 
 ```text
-Node (io_uring) ──WiFi 7──→ Hub (O(1) Re-Order Buffer) ──Multi-Path LEO/MEO──→ Satellite Constellation ──Fiber──→ ISP ──→ User PC
-
+Node (io_uring) ──WiFi 7──→ Hub [io_uring WiFi AP │ AF_XDP WAN] ──Multi-Path LEO/MEO──→ Satellite Constellation ──Fiber──→ ISP ──→ User PC
 ```
 
 ---
 
-## II. Source Tree Architecture
+## §3. Source Tree Architecture
 
 ```text
 m13/
-├── Cargo.toml                      ← workspace: [hub, node, tests], release: LTO, panic=abort, codegen-units=1
-├── README.md
+├── Cargo.toml                      ← Workspace root: hub, node, tests
+├── README.md                       ← Architecture & system documentation
 ├── TODO.md                         ← Roadmap & technical debt ledger
+├── OTHERS.md                       ← Silicon provisioning, dependencies, V&V, telemetry
+├── OBSERVATIONS.md                 ← Quantified round metrics & comparisons
+├── PROTOCOL.md                     ← Engineering workflow & execution protocol
 │
-├── tests/                          ← INTEGRATION TEST SUITE (workspace member: m13-tests)
-│   ├── Cargo.toml                  ← depends on m13-hub; ring, ml-kem, ml-dsa, sha2, hkdf, rand
-│   └── integration.rs              ← 30 integration tests: VPP graph, AEAD, PQC handshake, wire parity
+├── tests/                          ← Integration test suite (m13-tests)
+│   ├── Cargo.toml
+│   ├── integration.rs              ← VPP graph, AEAD, PQC handshake, wire parity tests
+│   └── src/
+│       └── lib.rs
 │
-├── hub/                            ← THE HUB (AF_XDP / Satellite Aggregator)
-│   ├── Cargo.toml                  ← libc, ring, libbpf-sys, bytemuck, ml-kem, ml-dsa, sha2, hkdf, rand
-│   ├── build.rs                    ← eBPF object compilation & kernel bindgen
+├── hub/                            ← Hub: AF_XDP satellite aggregator
+│   ├── Cargo.toml
+│   ├── build.rs                    ← eBPF compilation & kernel bindgen
 │   ├── m13-hub.bb                  ← Yocto BitBake recipe
 │   ├── m13-hub.p4                  ← P4 behavioral model
 │   └── src/
 │       ├── lib.rs                  ← Public re-exports for tests
-│       ├── main.rs                 ← Orchestrator: main → run_executive → worker_entry → VPP loop
+│       ├── main.rs                 ← Orchestrator & VPP loop
 │       ├── engine/
-│       │   ├── mod.rs              ← pub mod protocol, runtime, spsc
-│       │   ├── protocol.rs         ← Wire format, PeerTable, Scheduler, JitterBuffer, RxBitmap
-│       │   ├── runtime.rs          ← TscCal, HexdumpState, Telemetry, FixedSlab, core pinning
-│       │   └── spsc.rs             ← Wait-free SPSC lock-free ring (128-byte CachePadded)
+│       │   ├── mod.rs
+│       │   ├── protocol.rs         ← Wire format, peer management, scheduling
+│       │   ├── runtime.rs          ← Telemetry, slab allocator, core pinning
+│       │   ├── spsc.rs             ← Lock-free SPSC ring
+│       │   └── typestate.rs        ← Compile-time FSM typestates
 │       ├── network/
-│       │   ├── mod.rs              ← PacketVector, PacketDesc, GraphCtx, CycleStats, Disposition, scatter
-│       │   ├── xdp.rs              ← AF_XDP Engine (1GB HugeTLB UMEM, ZeroCopyTx, XDP_ZEROCOPY)
-│       │   ├── bpf.rs              ← BPF Steersman (direct attach, no Option fallback)
-│       │   └── datapath.rs         ← VPP graph nodes, tun_read_batch (demand-driven SPSC), tun_write_vector
+│       │   ├── mod.rs
+│       │   ├── xdp.rs              ← AF_XDP zero-copy engine
+│       │   ├── bpf.rs              ← eBPF steering
+│       │   ├── datapath.rs         ← VPP graph nodes & TUN I/O
+│       │   └── uso_pacer.rs        ← Userspace Segmentation Offload
 │       └── cryptography/
 │           ├── mod.rs
-│           ├── aead.rs             ← AES-256-GCM: seal_frame, open_frame, encrypt/decrypt_batch_ptrs
-│           └── handshake.rs        ← PQC: ML-KEM-1024 + ML-DSA-87, process_client_hello_hub
+│           ├── aead.rs             ← AES-256-GCM batch encrypt/decrypt
+│           ├── handshake.rs        ← PQC handshake (server side)
+│           └── async_pqc.rs        ← Async PQC offload to Core 0
 │
-└── node/                           ← THE NODE (io_uring / Edge Endpoint)
-    ├── Cargo.toml                  ← libc, ring, io-uring 0.7, bytemuck, ml-kem, ml-dsa, sha2, hkdf, rand
+└── node/                           ← Node: io_uring edge endpoint
+    ├── Cargo.toml
     ├── build.rs                    ← Kernel bindgen
     ├── m13-node.bb                 ← Yocto BitBake recipe
     ├── m13-node.p4                 ← P4 behavioral model
     └── src/
-        ├── main.rs                 ← Orchestrator: main → run_uring_worker (CQE three-pass loop)
+        ├── main.rs                 ← Orchestrator & CQE three-pass loop
         ├── engine/
-        │   ├── mod.rs              ← pub mod protocol, runtime
-        │   ├── protocol.rs         ← Wire format, Assembler, fragment TX, build_m13_frame
-        │   └── runtime.rs          ← TscCal, NodeState FSM, HexdumpState
+        │   ├── mod.rs
+        │   ├── protocol.rs         ← Wire format, fragment assembly
+        │   └── runtime.rs          ← Node FSM & diagnostics
         ├── network/
-        │   ├── mod.rs              ← pub mod datapath, uring_reactor
-        │   ├── datapath.rs         ← TUN creation, route setup/teardown, nuke_cleanup
-        │   └── uring_reactor.rs    ← io_uring SQPOLL + PBR zero-syscall reactor
+        │   ├── mod.rs
+        │   ├── datapath.rs         ← TUN creation & route management
+        │   └── uring_reactor.rs    ← io_uring SQPOLL + PBR reactor
         └── cryptography/
             ├── mod.rs
-            ├── aead.rs             ← AES-256-GCM: seal_frame, open_frame, decrypt_batch_ptrs (4-wide AES-NI)
-            └── handshake.rs        ← PQC: ML-KEM-1024 + ML-DSA-87, initiate_handshake (client side)
+            ├── aead.rs             ← AES-256-GCM batch encrypt/decrypt
+            └── handshake.rs        ← PQC handshake (client side)
 ```
 
 ---
 
-## III. Phase 1: Build & Execution Chains
+## §4. Phase 1: Build & Execution Chains
 
 ### 1. Hub Build
 
@@ -104,17 +140,17 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --manifest-path hub/Cargo
 **What happens:**
 
 1.  **`hub/build.rs`** executes first:
-    -   Compiles the eBPF XDP object from inline C via `clang -target bpf`
-    -   Runs `bindgen` against kernel headers to generate `ethtool_ringparam`, `ifreq` FFI bindings
-    -   Emits `OUT_DIR/m13_xdp.o` (the XDP redirect program) and `OUT_DIR/bindings.rs`
+    -   Writes inline eBPF C source to `OUT_DIR/m13_xdp.c`
+    -   Compiles it via `clang -O2 -g -target bpf` → `OUT_DIR/m13_xdp.o`
+    -   Sets `BPF_OBJECT_PATH` env var (consumed at runtime by `BpfSteersman`)
+    -   Runs `bindgen` against `linux/ethtool.h`, `linux/sockios.h`, `linux/if.h`
+    -   Emits `OUT_DIR/bindings.rs` (`ethtool_ringparam`, `ifreq`, `SIOCETHTOOL`)
 
-2.  **`rustc`** compiles the workspace with release profile:
-    -   `panic = "abort"` — no unwind tables, smaller binary
-    -   `lto = true` — whole-program link-time optimization across all crates
-    -   `codegen-units = 1` — maximum optimization (no parallel codegen splitting)
-    -   `-C target-cpu=native` — AVX2/AES-NI intrinsics on x86_64, NEON/CE on aarch64
+2.  **`rustc`** compiles with workspace release profile:
+    -   `panic = "abort"`, `lto = true`, `codegen-units = 1`, `opt-level = 3`, `strip = "symbols"`
+    -   `-C target-cpu=native` → AVX2/AES-NI on x86_64, NEON/CE on aarch64
 
-3.  **Output:** `target/release/m13-hub` (statically linked, symbols stripped)
+3.  **Output:** `target/release/m13-hub`
 
 ### 2. Hub Execution
 
@@ -129,73 +165,95 @@ main()
 ├── Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN
 ├── Panic hook: nuke_cleanup_hub() on unwind
 ├── CLI parse: if_name="enp1s0f0", tunnel=true, single_queue=Some(0)
-├── Set M13_LISTEN_PORT=443 (default)
+│   ├── Also supports: --monitor, --hexdump, --port, -i/--iface
+│   └── --monitor → run_monitor() → read /dev/shm telemetry (exits early)
+├── Set M13_LISTEN_PORT=443 (default, CLI --port overrides, then env var)
 └── run_executive(&if_name, single_queue, tunnel)
 
 run_executive()
+├── Re-register signal handlers (SIGTERM/SIGINT)
 ├── Pre-flight cleanup:
-│   ├── Kill stale m13-hub processes via pgrep/SIGKILL
+│   ├── Kill stale m13-hub processes via pgrep/SIGKILL (excludes own PID)
 │   ├── Detach stale XDP: ip link set <if> xdp off
-│   ├── [R-01] ethtool -L <if> combined 1 — collapse NIC to single queue
-│   └── Auto-allocate hugepages: write (workers × UMEM_SIZE / 2MB) to procfs
-├── TSC calibration (rdtsc loop)
+│   ├── Detach stale XDP: ip link set <if> xdpgeneric off
+│   ├── ethtool -L <if> combined 1 — collapse NIC to single queue
+│   └── Auto-allocate hugepages: write (workers × UMEM_SIZE / 2MB) to /proc/sys/vm/nr_hugepages
+├── TSC calibration: calibrate_tsc() (rdtsc loop)
 ├── lock_pmu() + fence_interrupts() + discover_isolated_cores()
-├── Worker count = 1 (single-queue mode)
-├── [R-01] BpfSteersman::load_and_attach(if_name) → direct return (panics on failure)
-├── Create TUN interface m13tun0 + setup_nat()
+├── Worker count = 1 (single-queue mode) or min(isolated_cores, MAX_WORKERS)
+├── BpfSteersman::load_and_attach(if_name)
+│   └── Steers EtherType 0x88B5 (raw L2) and IPv4 UDP/443 to AF_XDP via XSKMAP
+├── Create TUN m13tun0 + setup_nat() (if --tunnel)
 │
-├── [R-02A] SPSC Ring Creation:
-│   ├── 4 rings × depth 2048:
-│   │   ├── tx_tun: Producer<PacketDesc> → Consumer<PacketDesc>     (datapath → TUN HK)
-│   │   ├── rx_tun: Producer<PacketDesc> → Consumer<PacketDesc>     (TUN HK → datapath)
-│   │   ├── free_to_tun: Producer<u32> → Consumer<u32>             (datapath → TUN HK slab IDs)
-│   │   └── free_to_dp: Producer<u32> → Consumer<u32>              (TUN HK → datapath slab IDs)
-│   └── OnceLock<(usize, u32)> for UMEM base sharing
+├── SPSC Ring Creation (4 TUN rings × depth 2048):
+│   ├── tx_tun:       Producer<PacketDesc> → Consumer<PacketDesc>    (datapath → TUN HK)
+│   ├── rx_tun:       Producer<PacketDesc> → Consumer<PacketDesc>    (TUN HK → datapath)
+│   ├── free_to_tun:  Producer<u32> → Consumer<u32>                  (datapath → TUN HK slab IDs)
+│   └── free_to_dp:   Producer<u32> → Consumer<u32>                  (TUN HK → datapath slab IDs)
+├── OnceLock<(usize, u32)> for UMEM base sharing between Worker 0 and TUN HK
 │
-├── [R-02A] TUN Housekeeping Thread spawn:
-│   ├── Pinned to last isolated core
-│   ├── Receives: tx_tun_cons, rx_tun_prod, free_to_tun_cons, free_to_dp_prod, umem_info
-│   └── tun_housekeeping_thread():
-│       ├── Block until OnceLock published by Worker 0
-│       ├── DPDK-style local cache: [u32; 4096] pending_return
-│       └── Main loop:
-│           ├── Phase 0: Drain pending_return → free_slab_tx
-│           ├── Phase 1 (TX): Pop PacketDesc from rx_from_dp → write(tun_fd) → return slab
-│           └── Phase 2 (RX): poll(POLLIN,1ms) → alloc from free_slab_rx → read(tun_fd) → 
-│               build Eth+M13 header in UMEM → push PacketDesc to tx_to_dp
+├── TUN Housekeeping Thread spawn (pinned to last isolated core):
+│   ├── Blocks until OnceLock published by Worker 0
+│   ├── DPDK-style local cache: [u32; 4096] pending_return
+│   └── Main loop:
+│       ├── Phase 0: Drain pending_return → free_slab_tx
+│       ├── Phase 1 (TX): Pop PacketDesc from rx_from_dp → write(tun_fd) → return slab
+│       └── Phase 2 (RX): poll(POLLIN,1ms) → alloc from free_slab_rx → read(tun_fd) →
+│           build Eth+M13 header in UMEM → push PacketDesc to tx_to_dp
 │
 ├── Worker 0 handle distribution via .take():
 │   └── Only worker 0 gets SPSC Producer/Consumer handles
 │
-└── worker_entry():
+└── worker_entry() (per worker thread):
     ├── pin_to_core(core_id) + verify_affinity()
+    ├── Telemetry::map_worker() → /dev/shm mmap
     ├── Engine::new_zerocopy(if_name, queue_id, bpf_map_fd) → AF_XDP bind
-    ├── [R-02A] umem_info.set((umem_base, FRAME_SIZE)) → unblock TUN HK
-    ├── FixedSlab::new(8192), Scheduler, PeerTable, ReceiverState
+    ├── Worker 0: umem_info.set() → unblock TUN HK thread
+    ├── FixedSlab::new(8192), Scheduler, PeerTable, ReceiverState, RxBitmap
+    ├── Detect hub IP from interface, resolve gateway MAC from ARP
     ├── Pre-stamp all 8192 slab frames with Eth+M13 headers
+    ├── Measure ε_proc (processing jitter floor), create JitterBuffer
+    │
+    ├── PQC Arena Allocation:
+    │   ├── payload_arena: [[0u8; 9216]; MAX_PEERS] → leaked *mut (datapath writes, Core 0 reads)
+    │   └── hs_state_arena: [FlatHubHandshakeState; MAX_PEERS] → leaked *mut (Core 0 local)
+    ├── PQC SPSC Rings (2 × depth 128):
+    │   ├── pqc_req: Producer<PqcReq> → Consumer<PqcReq>   (datapath → Core 0)
+    │   └── pqc_resp: Producer<PqcResp> → Consumer<PqcResp> (Core 0 → datapath)
+    ├── PQC Control Plane Thread spawn (Core 0):
+    │   └── pqc_worker_thread(): Pop PqcReq → process ClientHello/Finished → push PqcResp
+    ├── EdtPacer::new(cal, 100_000_000) — zero-spin EDT, 100 Mbps default MANET link
     │
     └── VPP Main Loop:
-        ├── SHUTDOWN check
+        ├── SHUTDOWN check → graceful close: 3× FIN burst, drain until FIN-ACK or deadline
         ├── engine.recycle_tx() + engine.refill_rx()
         │
-        ├── TUN TX Graph (worker 0 only):
-        │   ├── Build GraphCtx with SPSC handles + hexdump + cal
-        │   │   tx_tun_prod, rx_tun_cons, free_to_tun_prod, free_to_dp_cons,
-        │   │   hexdump: &mut HexdumpState, cal: TscCal
-        │   └── execute_tx_graph(&mut ctx) → tun_read_batch():
-        │       ├── Reclaim returned slabs: free_to_dp_cons.pop_batch() → slab.free()
-        │       ├── Demand-driven provision: free_to_tun_prod.available() → bounded alloc
-        │       └── Pop pre-built TUN frames: rx_tun_cons.pop_batch() → inject
+        ├── TX Graph (worker 0 only):
+        │   ├── Reclaim returned slabs: free_to_dp_cons.pop_batch() → slab.free()
+        │   ├── Demand-driven provision: free_to_tun_prod.available() → bounded alloc
+        │   └── Pop pre-built TUN frames: rx_tun_cons.pop_batch() → encrypt → enqueue
         │
         ├── RX Graph:
-        │   ├── engine.poll_rx() → PacketVector
-        │   ├── scatter() → per-packet classification [network/mod.rs]
-        │   ├── VPP graph nodes: rx_parse, classify, aead_decrypt_vector, handshake
-        │   ├── tun_write_vector() → SPSC push or VFS fallback
-        │   └── Build GraphCtx with SPSC handles + hexdump + cal
+        │   ├── engine.poll_rx() → rx_batch[]
+        │   ├── execute_graph() → execute_subvector() per 64-packet chunk:
+        │   │   ├── rx_parse_raw() → PacketVector
+        │   │   ├── aead_decrypt_vector() → batch AEAD
+        │   │   ├── classify/scatter → per-packet Disposition
+        │   │   ├── Handshake fragments → Assembler → PQC SPSC dispatch to Core 0
+        │   │   └── tun_write_vector() → SPSC push to TUN HK
+        │   └── CycleStats accumulation → Telemetry SHM via fetch_add(Relaxed)
+        │
+        ├── PQC Response Drain:
+        │   ├── Pop PqcResp batch from pqc_resp_cons
+        │   ├── ServerHello: frame with datapath-local hub_ip/gateway_mac
+        │   │   → build_fragmented_raw_udp() → enqueue_critical via AF_XDP
+        │   └── SessionEstablished: install AES-256-GCM cipher
+        │       → PeerLifecycle::Established, clear hs_sidecar
+        │
+        ├── Feedback generation: stage_feedback_gen() if receiver state indicates
         │
         └── Telemetry: 1/sec report:
-            RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{}
+            RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD:{}/{} HS:{}/{} Slab:{}/{} Peers:{}/{} Up:{}s
 ```
 
 ### 3. Node Build
@@ -207,19 +265,18 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --manifest-path node/Carg
 **What happens:**
 
 1.  **`node/build.rs`** executes first:
-    -   Runs `bindgen` against kernel headers to generate `ethtool_ringparam`, `ifreq` FFI bindings
-    -   Emits `OUT_DIR/bindings.rs`
+    -   Runs `bindgen` against `linux/ethtool.h`, `linux/sockios.h`, `linux/if.h`
+    -   Emits `OUT_DIR/bindings.rs` (`ethtool_ringparam`, `ifreq`)
+    -   No eBPF compilation (Node uses `io_uring`, not `AF_XDP`)
 
 2.  **`rustc`** compiles with identical release profile (LTO, panic=abort, codegen-units=1, target-cpu=native)
 
-3.  **`io-uring = "0.7"`** crate provides safe Rust bindings for `io_uring` syscalls
-
-4.  **Output:** `target/release/m13-node`
+3.  **Output:** `target/release/m13-node`
 
 ### 4. Node Execution
 
 ```bash
-sudo RUST_LOG=debug ./target/release/m13-node --hub-ip 67.213.122.195:443 --tunnel
+sudo RUST_LOG=debug ./target/release/m13-node --hub-ip 206.223.224.25:443 --tunnel
 ```
 
 **Exact execution sequence** (`node/src/main.rs`):
@@ -229,685 +286,815 @@ main()
 ├── Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN
 ├── Panic hook: nuke_cleanup_node()
 ├── CLI parse: echo=false, hexdump=false, tunnel=true
-├── create_tun("m13tun0") → TUN fd
-├── Parse --hub-ip "67.213.122.195:443"
+├── create_tun("m13tun0") → TUN fd (if --tunnel)
+├── Parse --hub-ip "206.223.224.25:443" (required)
 ├── Store Hub IP in HUB_IP_GLOBAL Mutex (for panic hook route teardown)
 └── run_uring_worker(&ip, echo, hexdump, tun_file)
 
 run_uring_worker()
 ├── TSC calibration: calibrate_tsc()
 ├── System tuning: tune_system_buffers()
-│   └── sysctl: net.core.rmem_max, wmem_max, netdev_max_backlog
+│   └── sysctl: net.core.rmem_max, wmem_max, netdev_max_backlog, rmem_default, wmem_default
 ├── UdpSocket::bind("0.0.0.0:0") → connect(hub_addr)
-├── Socket tuning: SO_RCVBUFFORCE=8MB, SO_SNDBUFFORCE=8MB
+├── Socket: O_NONBLOCK, SO_RCVBUFFORCE=8MB, SO_SNDBUFFORCE=8MB
 │
 ├── UringReactor::new(raw_fd, cpu=0):
-│   ├── uring_reactor.rs:
-│   │   ├── HugeTLB mmap: 2MB-aligned arena (PBR metadata + data frames)
-│   │   ├── IoUring::builder().setup_sqpoll(2000ms).setup_single_issuer()
-│   │   ├── SYS_io_uring_register IORING_REGISTER_PBUF_RING
-│   │   └── Pre-register all BIDs in PBR
+│   ├── HugeTLB mmap: 2MB-aligned arena (PBR metadata + data frames)
+│   ├── IoUring::builder().setup_sqpoll(2000ms).setup_single_issuer()
+│   ├── SYS_io_uring_register IORING_REGISTER_PBUF_RING
+│   ├── Pre-register all BIDs in PBR
 │   └── arm_multishot_recv() → single SQE for lifetime of socket
 │
-├── TUN fd extraction + arm TUN reads
+├── Arm TUN reads: BIDs in [UDP_RING_ENTRIES .. TOTAL_BIDS)
+├── Assembler::init(alloc_asm_arena()) — fragment reassembly state
 ├── Counter init: seq_tx, rx/tx/aead/tun counters
 ├── Build M13 header template (src_mac, hub_mac, magic, version)
-├── Send initial registration frame
+├── Send initial registration frame via sock.send()
 ├── State machine init: NodeState::Registering
 │
 └── CQE Three-Pass Main Loop:
     ├── SHUTDOWN check
-    ├── Connection timeout: 30s pre-Established
+    ├── Connection timeout: 30s pre-Established → exit
     │
     ├── ═══ Pass 0: CQE Drain + Classify ═══
     │   ├── reactor.ring.completion().sync()
     │   ├── Drain up to 128 CQEs into cqe_batch[]
     │   ├── For each CQE, classify by tag:
     │   │   ├── TAG_UDP_RECV_MULTISHOT → collect into recv_bids[]/recv_lens[]
+    │   │   │   └── Track multishot termination (IORING_CQE_F_MORE == 0 → rearm)
     │   │   ├── TAG_TUN_READ → build M13 header in-place → seal_frame → stage_udp_send
-    │   │   ├── TAG_TUN_WRITE → recycle BID to PBR
-    │   │   └── TAG_UDP_SEND_TUN/ECHO → arm_tun_read(bid) to recycle BID
+    │   │   ├── TAG_TUN_WRITE → recycle BID to PBR (add_buffer_to_pbr + commit_pbr)
+    │   │   └── TAG_UDP_SEND_ECHO/TUN → arm_tun_read(bid) to recycle BID
     │   └── recv_count = number of UDP recv CQEs in this batch
     │
     ├── ═══ Pass 1: Vectorized AEAD Batch Decrypt ═══
     │   ├── If Established AND recv_count > 0:
     │   │   ├── Scan recv frames for crypto_flag == 0x01 → collect enc_ptrs[]
     │   │   ├── decrypt_batch_ptrs(enc_ptrs, enc_lens, enc_count, cipher)
-    │   │   │   └── 4-at-a-time AES-NI prefetch saturates crypto pipeline
     │   │   │   └── Stamps PRE_DECRYPTED_MARKER (0x02) on success
     │   │   └── Rekey check: frame_count >= limit || time > limit
     │
     ├── ═══ Pass 2: Per-Frame RxAction Dispatch ═══
-    │   ├── For each recv frame (PRE_DECRYPTED_MARKER skips scalar decrypt):
-    │   │   ├── process_rx_frame() → RxAction
+    │   ├── For each recv frame:
+    │   │   ├── process_rx_frame() → RxAction (PRE_DECRYPTED_MARKER skips scalar decrypt)
     │   │   ├── RxAction::NeedHandshakeInit → initiate_handshake() (PQC ClientHello)
-    │   │   ├── RxAction::TunWrite → stage_tun_write(tun_fd, ptr, len, bid)
+    │   │   ├── RxAction::TunWrite → stage_tun_write(tun_fd, ptr, len, bid) — BID deferred
     │   │   ├── RxAction::Echo → build_echo_frame → seal_frame → sock.send
     │   │   ├── RxAction::HandshakeComplete → derive AEAD key → NodeState::Established
-    │   │   │   └── setup_tunnel_routes(&hub_ip)
+    │   │   │   └── Finished sent via send_fragmented_udp() → setup_tunnel_routes()
     │   │   ├── RxAction::HandshakeFailed → NodeState::Disconnected
     │   │   └── RxAction::RekeyNeeded → NodeState::Registering
     │   └── Recycle BID to PBR (unless deferred by TunWrite)
     │
     ├── Re-arm multishot recv if terminated
-    ├── Handshake timeout → re-register
-    ├── Keepalive: 100ms, pre-Established only
+    ├── Handshake micro-timeout: 250ms retransmit via send_fragmented_udp()
+    ├── Keepalive: 100ms interval, pre-Established only
+    ├── Assembler GC: every 5 telemetry ticks
     ├── Telemetry: 1/sec:
-    │   RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{}
+    │   RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{} Up:{}s
     └── reactor.submit() + submit_and_wait(0)
 ```
 
 ---
 
-## IV. Connection Lifecycle: Registration → PQC Handshake → Established Tunnel
+## §5. Connection Lifecycle: Registration → PQC Handshake → Established Tunnel
 
-This section traces the **complete end-to-end datapath** from the moment a Node starts to the point where bidirectional AEAD-encrypted tunnel traffic flows. Every step is canonical, deterministic, and traceable to a specific source location.
+These two commands constitute the **entire** connection lifecycle. The Hub must be started first — it listens passively. The Node initiates the connection.
 
 ### Wire Protocol Constants
 
-| Constant | Value | Defined In |
-|----------|-------|-----------|
-| `M13_WIRE_MAGIC` | `0xD1` | `engine/protocol.rs` |
-| `M13_WIRE_VERSION` | `0x01` | `engine/protocol.rs` |
-| `ETH_P_M13` | `0x88B5` | `engine/protocol.rs` |
-| `FLAG_CONTROL` | `0x80` | `engine/protocol.rs` |
-| `FLAG_HANDSHAKE` | `0x10` | `engine/protocol.rs` |
-| `FLAG_FRAGMENT` | `0x08` | `engine/protocol.rs` |
-| `FLAG_TUNNEL` | `0x01` | `engine/protocol.rs` |
-| `HS_CLIENT_HELLO` | `0x01` | `engine/protocol.rs` |
-| `HS_SERVER_HELLO` | `0x02` | `engine/protocol.rs` |
-| `HS_FINISHED` | `0x03` | `engine/protocol.rs` |
-| `DIR_HUB_TO_NODE` | `0x00` | `engine/protocol.rs` |
-| `DIR_NODE_TO_HUB` | `0x01` | `engine/protocol.rs` |
-
-### Message Sizes
-
-| Message | Composition | Total |
-|---------|------------|-------|
-| ClientHello (Msg 1) | type(1) + version(1) + nonce(32) + ML-KEM-1024 ek(1568) + ML-DSA-87 pk(2592) | **4,194 B** |
-| ServerHello (Msg 2) | type(1) + ML-KEM-1024 ct(1568) + ML-DSA-87 pk(2592) + ML-DSA-87 sig(4627) | **8,788 B** |
-| Finished (Msg 3) | type(1) + ML-DSA-87 sig(4627) | **4,628 B** |
-| Fragment MTU | 1402 B payload (MTU 1500 − IP(20) − UDP(8) − M13 overhead(70)) | — |
-| ClientHello fragments | ⌈4194 / 1402⌉ | **3 fragments** |
-| ServerHello fragments | ⌈8788 / 1402⌉ | **7 fragments** |
-| Finished fragments | ⌈4628 / 1402⌉ | **4 fragments** |
+| Constant | Value | Source | Purpose |
+|---|---|---|---|
+| `ETH_P_M13` | `0x88B5` | `hub/engine/protocol.rs`, `node/engine/protocol.rs` | IEEE 802.1 Local Experimental EtherType |
+| `M13_WIRE_MAGIC` | `0xD1` | both `protocol.rs` | Wire magic byte at `signature[0]` |
+| `M13_WIRE_VERSION` | `0x01` | both `protocol.rs` | Protocol version at `signature[1]` |
+| `FLAG_CONTROL` | `0x80` | both `protocol.rs` | Control frame (echo, keepalive) |
+| `FLAG_FEEDBACK` | `0x40` | `hub/engine/protocol.rs` | Receiver feedback (loss/RTT) |
+| `FLAG_TUNNEL` | `0x20` | both `protocol.rs` | Encapsulated user IP traffic |
+| `FLAG_FIN` | `0x08` | `hub/engine/protocol.rs`, `node/engine/protocol.rs` | Graceful close signal |
+| `FLAG_FEC` | `0x04` | `hub/engine/protocol.rs` | Reserved (formerly RLNC FEC, now unused) |
+| `FLAG_HANDSHAKE` | `0x02` | both `protocol.rs` | PQC handshake control |
+| `FLAG_FRAGMENT` | `0x01` | both `protocol.rs` | Fragmented message |
+| `HS_CLIENT_HELLO` | `0x01` | both `protocol.rs` | Handshake sub-type: ClientHello |
+| `HS_SERVER_HELLO` | `0x02` | both `protocol.rs` | Handshake sub-type: ServerHello |
+| `HS_FINISHED` | `0x03` | both `protocol.rs` | Handshake sub-type: Finished |
+| `DIR_HUB_TO_NODE` | `0x00` | `hub/engine/protocol.rs` | AEAD nonce direction byte (Hub→Node) |
+| `DIR_NODE_TO_HUB` | `0x01` | both `protocol.rs` | AEAD nonce direction byte (Node→Hub) |
+| `USO_MTU` | `1380` | `hub/network/uso_pacer.rs:22` | USO slicer MTU for EDT pacing |
+| `PRE_DECRYPTED_MARKER` | `0x02` | `node/cryptography/aead.rs:56` | Stamp at `signature[2]` after batch decrypt success |
+| `MAX_PEERS` | `256` | `hub/engine/protocol.rs` | PeerTable flat array capacity |
+| `TUNNEL_SUBNET` | `10.13.0.0` | `hub/engine/protocol.rs` | Tunnel IP allocation range (/24) |
+| `VECTOR_SIZE` | `64` | `hub/network/mod.rs` | VPP packet vector width |
+| `JBUF_CAPACITY` | `128` | `hub/engine/protocol.rs` | Jitter buffer circular capacity |
+| `TX_RING_SIZE` | `256` | `hub/engine/protocol.rs` | Scheduler ring depth (critical + bulk) |
+| `FEEDBACK_INTERVAL_PKTS` | `32` | `hub/engine/protocol.rs` | Packets between feedback frame generation |
 
 ### Protocol Timing Constants
 
-| Constant | Value | Defined In |
-|----------|-------|----------|
-| `HANDSHAKE_TIMEOUT_NS` | 5 s (`5_000_000_000`) | `engine/protocol.rs:42` |
-| `REKEY_FRAME_LIMIT` | 2³² frames (`1u64 << 32`) | `engine/protocol.rs:44` |
-| `REKEY_TIME_LIMIT_NS` | 3600 s (`3_600_000_000_000`) | `engine/protocol.rs:46` |
-| Keepalive interval | 100 ms (`100_000_000` ns) | `main.rs` (inline) |
-| Connection timeout | 30 s (`30_000_000_000` ns) | `main.rs` (inline, io_uring path) |
+| Constant | Value | Source | Purpose |
+|---|---|---|---|
+| `REKEY_FRAME_LIMIT` | `2³² (4,294,967,296)` | both `protocol.rs` | Rekey after this many frames under one session key |
+| `REKEY_TIME_LIMIT_NS` | `3,600,000,000,000 (1h)` | both `protocol.rs` | Rekey after 1 hour under one session key |
+| `HANDSHAKE_RETX_INTERVAL_NS` | `250,000,000 (250ms)` | `node/engine/protocol.rs:44` | ClientHello/Finished retransmission micro-ARQ |
+| `FEEDBACK_RTT_DEFAULT_NS` | `10,000,000 (10ms)` | `hub/engine/protocol.rs` | Default RTT estimate for feedback gating |
+
+### Message Sizes
+
+| Message | Size | Breakdown | Source |
+|---|---|---|---|
+| **EthernetHeader** | 14 B | `dst(6) + src(6) + ethertype(2)` | both `protocol.rs` |
+| **M13Header** | 48 B | `signature(32) + seq_id(8) + flags(1) + payload_len(4) + padding(3)` | both `protocol.rs` |
+| **FragHeader** | 8 B | `msg_id(2) + index(1) + total(1) + offset(2) + len(2)` | both `protocol.rs` |
+| **FeedbackFrame** | 40 B | `highest_seq(8) + rx_timestamp_ns(8) + delivered(4) + delivered_time_ns(8) + loss_count(4) + nack_bitmap(8)` | `hub/engine/protocol.rs` |
+| **Feedback on wire** | 102 B | `ETH(14) + M13(48) + FeedbackFrame(40)` | `hub/engine/protocol.rs` (`FEEDBACK_FRAME_LEN`) |
+| **AssemblySlot** | 9,280 B | `buf(9216) + metadata(64) = 145 cache lines, align(64)` | both `protocol.rs` |
+| **ClientHello** | 4,194 B | `type(1) + version(1) + nonce(32) + ek(1568) + pk_node(2592)` | `hub/cryptography/handshake.rs:6` |
+| **ServerHello** | 8,788 B | `type(1) + ct(1568) + pk_hub(2592) + sig_hub(4627)` | `hub/cryptography/handshake.rs:9` |
+| **Finished** | 4,628 B | `type(1) + sig_node(4627)` | `hub/cryptography/handshake.rs:7` |
+| **Registration frame** | 62 B | `ETH(14) + M13(48), flags=0x00` | `node/main.rs` (`sock.send()`) |
+| **Echo frame** | 62 B | `ETH(14) + M13(48), flags=FLAG_CONTROL` | `hub/main.rs` (registration echo) |
+| **Max fragment payload** | 1,402 B | Inline `max_chunk` in `build_fragmented_*` functions | both `protocol.rs` |
 
 ### AEAD Wire Geometry (M13 Header Byte Map)
 
-AEAD operates on the 48-byte M13 header starting at `offset` (ETH_HDR_SIZE for L2, or 56 for UDP).
-
 ```text
-offset +  0: signature[0] = M13_WIRE_MAGIC (0xD1)     ─┐
-offset +  1: signature[1] = M13_WIRE_VERSION (0x01)    │ AAD (4 bytes)
-offset +  2: signature[2] = crypto_ver                 │  0x00=cleartext, 0x01=encrypted
-offset +  3: signature[3] = reserved (0x00)            ─┘
-offset +  4: signature[4..20]  = AEAD tag (16 bytes)      ← GCM authentication tag
-offset + 20: signature[20..32] = nonce (12 bytes)         ← seq_id(8) || direction(1) || zeros(3)
-offset + 32: [encrypted region begins]                    ← seq_id, flags, payload_len, padding (16B)
-offset + 48: [payload begins]                             ← IP packet or fragment data
+Byte   Field                    Encrypted?   Notes
+─────  ───────────────────────  ──────────   ─────────────────────────────────────
+ 0- 5  dst MAC                  No           Ethernet: broadcast or peer MAC
+ 6-11  src MAC                  No           Ethernet: interface MAC
+12-13  EtherType                No           0x88B5 (big-endian on wire)
+   14  signature[0] = magic     No           0xD1 (M13_WIRE_MAGIC)
+   15  signature[1] = version   No           0x01 (M13_WIRE_VERSION)
+   16  signature[2] = crypto_v  No           0x00=cleartext, 0x01=encrypted, 0x02=pre-decrypted
+   17  signature[3] = reserved  No           0x00 (set explicitly by seal_frame)
+18-33  signature[4..20] = tag   No           16-byte AES-256-GCM authentication tag
+34-45  signature[20..32] = nonce No          12-byte AEAD nonce: seq_id(8) || direction(1) || zeros(3)
+46-53  seq_id                   YES          8 bytes, little-endian, monotonic
+   54  flags                    YES          Single-byte bitfield (see FLAG_* table)
+55-58  payload_len              YES          4 bytes, little-endian
+59-61  padding                  YES          3 bytes, zero
+  62+  payload                  YES          Variable: tunnel IP data or handshake fragment
 ```
 
-**Nonce construction** (`seal_frame` in `aead.rs`):
-- `nonce[0..8]` = `seq_id` as LE u64 (full 64-bit sequence number)
-- `nonce[8]` = `direction` byte (`0x00` = Hub→Node, `0x01` = Node→Hub)
-- `nonce[9..12]` = `0x00` (zero-padded to 12 bytes)
-- **Reflection guard**: `open_frame` rejects if `nonce[8] == our_dir`, preventing self-inflicted replay.
+**Encrypted region:** `signature[2]` is set to `0x01` by `seal_frame`. Bytes `[m13_off+32..frame_end]` are encrypted in-place via AES-256-GCM. The 16-byte authentication tag is stored in `signature[4..20]`.
+
+**Nonce construction** (`hub/cryptography/aead.rs`, `node/cryptography/aead.rs`):
+```text
+nonce[0..8] = seq_id as little-endian u64 (8 bytes, monotonic counter)
+nonce[8]    = direction byte (DIR_HUB_TO_NODE=0x00 or DIR_NODE_TO_HUB=0x01)
+nonce[9..12]= zeros (3 bytes)
+               Total: 12 bytes (AES-256-GCM standard nonce)
+```
+The full 12-byte nonce is stored on-wire at `signature[20..32]`. On decrypt, `open_frame()` reads it back from the frame.
+
+**AAD:** `signature[0..4]` (magic + version + crypto_ver + reserved) = 4 bytes of Associated Authenticated Data.
+
+**Reflection guard:** `open_frame()` rejects frames where `nonce_bytes[8] == our_dir`. A Hub (`DIR_HUB_TO_NODE=0x00`) only accepts frames with `nonce[8]=0x01` (Node→Hub). This prevents replaying a party's own frames back at it.
+
+**Offset parameter:** Hub AEAD functions take an `offset` parameter to handle different wire encodings:
+- L2 mode: `offset = ETH_HDR_SIZE (14)` — M13 header immediately after Ethernet
+- UDP mode: `offset = 42` (ETH + IP + UDP headers, `RAW_HDR_LEN` from `hub/network/datapath.rs`)
 
 ### Sequence Diagram
 
 ```text
-    Node                                      WAN (UDP)                                  Hub
-     │                                            │                                       │
-     │  ┌─────────────────────────────────┐       │                                       │
-     │  │ 0. build_m13_frame(FLAG_CONTROL)│       │                                       │
-     │  │    → NodeState::Registering     │       │                                       │
-     │  └─────────────────────────────────┘       │                                       │
-     │ ═══ Registration Frame (62B) ══════════════╬════════════════════════════════════=═►│
-     │                                            │  rx_parse_raw() → lookup_or_insert()  │
-     │                                            │  → PeerSlot allocated, PeerAddr saved │
-     │                                            │  classify: FLAG_CONTROL → Consumed    │
-     │                                            │  (Hub does NOT echo — silent insert)  │
-     │ ... keepalive probes (100ms) ...           │                                       │
-     │ ═══ Keepalive (62B, FLAG_CONTROL) ═════════╬════════════════════════════════════=═►│
-     │                                            │  (Consumed — refreshes NAT binding)   │
-     │                                            │                                       │
-     │  ┌─────────────────────────────────┐       │                                       │
-     │  │ 1. On receipt of any valid M13  │       │                                       │
-     │  │    frame while Registering:     │       │                                       │
-     │  │    process_rx_frame() →         │       │                                       │
-     │  │    RxAction::NeedHandshakeInit  │       │                                       │
-     │  │    → initiate_handshake()       │       │                                       │
-     │  │    → ML-KEM-1024 keygen         │       │                                       │
-     │  │    → ML-DSA-87 keygen           │       │                                       │
-     │  │    → NodeState::Handshaking     │       │                                       │
-     │  └─────────────────────────────────┘       │                                       │
-     │ ═══ ClientHello (4194B, 3 frags) ══════════╬═══════════════════════════════════=══►│
-     │                                            │  rx_parse_raw() → classify (FRAGMENT) │
-     │                                            │  → Assembler::feed() × 3              │
-     │                                            │  → reassembly complete                │
-     │                                            │  → process_handshake_message()        │
-     │                                            │  ┌──────────────────────────────────┐ │
-     │                                            │  │ 2. process_client_hello_hub()    │ │
-     │                                            │  │    validate type/version/length  │ │
-     │                                            │  │    ML-KEM-1024 encapsulate → ss  │ │
-     │                                            │  │    ML-DSA-87 keygen              │ │
-     │                                            │  │    SHA-512(CH || ct) → transcript│ │
-     │                                            │  │    sign(transcript) → sig_hub    │ │
-     │                                            │  │    → PeerLifecycle::Handshaking  │ │
-     │                                            │  │    → HubHandshakeState stored    │ │
-     │                                            │  └──────────────────────────────────┘ │
-     │◄═══════════════════════════════════════════╬══ ServerHello (8788B, 7 frags) ═══════│
-     │                                            │  build_fragmented_raw_udp()           │
-     │  ┌─────────────────────────────────┐       │  → slab.alloc() × 7                   │
-     │  │ Assembler::feed() × 7           │       │  → scheduler.enqueue_critical() × 7   │
-     │  │ → reassembly complete           │       │                                       │ 
-     │  │ 3. process_handshake_node()     │       │                                       │ 
-     │  │    ML-KEM-1024 decapsulate → ss │       │                                       │
-     │  │    SHA-512(CH || ct) → verify   │       │                                       │
-     │  │    pk_hub.verify(transcript,sig)│       │                                       │
-     │  │    HKDF-SHA-512(nonce,ss) → key │       │                                       │
-     │  │    SHA-512(CH || SH) → sign     │       │                                       │
-     │  │    → HandshakeComplete          │       │                                       │
-     │  └─────────────────────────────────┘       │                                       │
-     │ ═══ Finished (4628B, 4 frags) ═════════════╬══════════════════════════════════════►│
-     │                                            │  Assembler::feed() × 4                │
-     │                                            │  → reassembly complete                │
-     │  ┌─────────────────────────────────┐       │  ┌──────────────────────────────────┐ │
-     │  │ 4. Install AEAD cipher          │       │  │ 4. process_finished_hub()        │ │
-     │  │    AES-256-GCM(session_key)     │       │  │    SHA-512(CH || SH) → transcript│ │
-     │  │    NodeState::Established       │       │  │    pk_node.verify(transcript,sig)│ │
-     │  │    Keepalives STOP              │       │  │    HKDF-SHA-512(nonce,ss) → key  │ │
-     │  │    setup_tunnel_routes()        │       │  │    Install AES-256-GCM cipher    │ │
-     │  └─────────────────────────────────┘       │  │    PeerLifecycle::Established    │ │
-     │                                            │  └──────────────────────────────────┘ │
-     │                                            │                                       │
-     │ ═══ AEAD Tunnel Traffic ═══════════════════╬══════════════════════════════════════►│
-     │◄═══════════════════════════════════════════╬═══════════════════════ AEAD Tunnel ═══│
-     │                                            │                                       │
-     │  ┌─ Failure Paths ─────────────────────────┼──────────────────────────────────────┐│
-     │  │ • HS timeout (5s):  re-register + assembler.clear_all() → Step 0                ││
-     │  │ • Conn timeout (30s, io_uring): process exit                                   ││
-     │  │ • Rekey (2³² frames or 3600s): → Registering → Step 0 (session key rotated)    ││
-     │  │ • HS failure: → Disconnected (wait for next valid frame → Registering)         ││
-     │  └────────────────────────────────────────────────────────────────────────────────┘│
+     Node                                          Hub
+       │                                            │
+       │  1. Registration: ETH+M13(62B, flags=0x00) │
+       │───────────────────────────────────────────→│ lookup_or_insert() → PeerLifecycle::Registered
+       │                                            │ Reconnection guard: evict same-IP stale peers
+       │                                            │
+       │  2. Echo: ETH+M13(62B, flags=FLAG_CONTROL) │
+       │←───────────────────────────────────────────│ 100ms throttled echo (slab-safe)
+       │                                            │
+       │  3. ClientHello (4194B, fragmented)         │
+       │  k=3 systematic frags × 1402B              │
+       │───────────────────────────────────────────→│ Assembler.feed() → reassemble
+       │                                            │ Dispatch to Core 0 via PQC SPSC ring
+       │                                            │
+       │                              ┌─────────────┤ Core 0: process_client_hello_hub()
+       │                              │  ML-KEM-1024 encaps + ML-DSA-87 sign
+       │                              │  ~10ms (cold-path, off datapath)
+       │                              └─────────────┤ PqcResp{msg_type=0x02, ServerHello payload}
+       │                                            │
+       │  4. ServerHello (8788B, fragmented)         │
+       │  k=7 systematic frags × 1402B              │
+       │  via build_fragmented_raw_udp()            │
+       │←───────────────────────────────────────────│ PQC drain → frame with local hub_ip/gw_mac
+       │                                            │
+       │  Node: process_rx_frame() →                │
+       │    Assembler.feed() → reassemble           │
+       │    ML-KEM-1024 decaps + HKDF-SHA-512       │
+       │    ML-DSA-87 verify hub signature          │
+       │    Derive session_key → install cipher     │
+       │    NodeState::Established                  │
+       │    setup_tunnel_routes()                   │
+       │                                            │
+       │  5. Finished (4628B, fragmented)            │
+       │  k=4 systematic frags × 1402B              │
+       │  via send_fragmented_udp()                 │
+       │───────────────────────────────────────────→│ Assembler.feed() → reassemble
+       │                                            │ Dispatch to Core 0 via PQC SPSC ring
+       │                              ┌─────────────┤ Core 0: process_finished_hub()
+       │                              │  ML-DSA-87 verify node signature
+       │                              │  ~5ms (cold-path, off datapath)
+       │                              └─────────────┤ PqcResp{msg_type=0x03, session_key}
+       │                                            │
+       │                                            │ PQC drain: install AES-256-GCM cipher
+       │                                            │ PeerLifecycle::Established
+       │                                            │ alloc_tunnel_ip() → 10.13.0.X
+       │                                            │
+       │══════════ AEAD Tunnel Established ═════════│
+       │                                            │
+       │  6a. Upstream: TUN read → seal_frame()     │
+       │  Batch encrypt_batch_ptrs (4-at-a-time)    │
+       │  → sock.send() via build_m13_frame()      │
+       │───────────────────────────────────────────→│ rx_parse_raw() → aead_decrypt_vector()
+       │                                            │ classify_route() → TunWrite
+       │                                            │ tun_write_vector() → SPSC → TUN HK thread
+       │                                            │
+       │  6b. Downstream: TUN HK read → SPSC →     │
+       │  execute_tx_graph() → seal_frame()         │
+       │  build_raw_udp_frame()                     │
+       │  EDT pacer → Scheduler → AF_XDP TX        │
+       │←───────────────────────────────────────────│
+       │  decrypt_batch_ptrs() → PRE_DECRYPTED_MARKER
+       │  process_rx_frame() → TunWrite             │
+       │  stage_tun_write() → kernel TUN            │
+       │                                            │
+       │  7. Feedback (every 32 pkts)                │
+       │←───────────────────────────────────────────│ produce_feedback_frame() (102B)
+       │                                            │
+       │  8. Rekey (2³² frames or 1 hour)            │
+       │  Node: RxAction::RekeyNeeded →             │
+       │  NodeState::Registering → restart from 1   │
+       │                                            │
 ```
 
-### Step-by-Step Code Trace
+### Phase 1: Hub Startup
 
-#### Step 0: Node Sends Registration Frame
-
-The Node sends a single 62-byte cleartext M13 frame with `FLAG_CONTROL` to establish a return path with the Hub. This is the very first packet on the wire.
+**Command:** `sudo RUST_LOG=debug ./target/release/m13-hub enp1s0f0 --tunnel --single-queue 0`
 
 ```text
-Node — node/src/main.rs
-├── build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL)  [protocol.rs:59]
-│   ├── Builds: ETH(14) + M13(48) = 62 bytes
-│   ├── EtherType: 0x88B5 (big-endian)
-│   ├── M13: magic=0xD1, version=0x01, seq_id=LE, flags=FLAG_CONTROL
-│   └── Direction: Not set (cleartext control frame)
-├── sock.send(&reg)                                            [main.rs:394 / 762]
-│   └── UDP connected socket → Hub IP:443
-└── state = NodeState::Registering                             [main.rs:396 / 764]
-```
+main()                                                        [hub/src/main.rs:44]
+├── Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN     [main.rs:48-51]
+├── Panic hook: nuke_cleanup_hub() on unwind                  [main.rs:55-59]
+├── CLI parse:                                                [main.rs:65-103]
+│   if_name = "enp1s0f0"
+│   tunnel_mode = true
+│   single_queue = Some(0)
+│   listen_port = Some(443)  ← default, blends with QUIC
+│   hexdump_mode = false
+├── Set M13_LISTEN_PORT = "443" (env var)                     [main.rs:109-123]
+└── run_executive("enp1s0f0", Some(0), true)                  [main.rs:124]
 
-#### Step 1: Hub Discovers Node (Peer Table Insert)
-
-The Hub's AF_XDP engine receives the UDP-encapsulated registration frame. The VPP `rx_parse_raw()` node extracts the source IP:port, inserts a new peer slot, and classifies the frame. **The Hub does NOT echo or reply** — `FLAG_CONTROL` frames are silently consumed. The Node's keepalive probes (every 100ms) serve only to maintain the NAT binding until the ClientHello exchange begins.
-
-```text
-Hub — hub/src/network/datapath.rs
-├── rx_parse_raw()                                             [datapath.rs:24]
-│   ├── Detect encapsulation: EtherType 0x0800 (IPv4/UDP)      [datapath.rs:70]
-│   ├── Extract src_ip from IP header [26..30]                  [datapath.rs:73]
-│   ├── Extract src_port from UDP header [34..36]               [datapath.rs:74]
-│   ├── Learn hub_ip from dst_ip [30..34] (first packet only)   [datapath.rs:81-84]
-│   ├── Learn gateway_mac from src_mac [0..6] (first packet)    [datapath.rs:86-89]
-│   ├── PeerAddr::new_udp(src_ip, src_port)                     [datapath.rs:94]
-│   ├── peers.lookup_or_insert(peer_addr, peer_mac)             [datapath.rs:96]
-│   │   └── First time: allocates PeerSlot, stores PeerAddr + MAC
-│   ├── M13 offset = 56 (ETH(14) + IP(20) + UDP(8) + FakeETH(14))
-│   ├── Validate magic=0xD1, version=0x01                       [datapath.rs:116-118]
-│   └── Route: crypto_ver=0x00 → cleartext_out PacketVector     [datapath.rs:132-140]
+run_executive()                                               [hub/src/main.rs:128]
+├── Re-register SIGTERM/SIGINT signal handlers                [main.rs:133-136]
 │
-└── classify_route()                                            [datapath.rs:385+]
-    └── FLAG_CONTROL → NextNode::Consumed                       [datapath.rs:401]
-        └── Silent consumption: Hub does NOT transmit any response
-```
-
-#### Step 1b: Node Keepalive Probing (Pre-Established Only)
-
-The Node sends `FLAG_CONTROL` frames every 100ms while **not** in `Established` state. These keepalives serve two purposes: (1) maintain the NAT/firewall UDP binding on the public internet, and (2) signal liveness to the Hub. **Keepalives stop immediately when the session is established** — tunnel traffic maintains the binding naturally.
-
-```text
-Node — node/src/main.rs (both paths: recvmmsg and io_uring)
-├── Guard: !matches!(state, Established) && (now - last_keepalive_ns > 100ms)
-├── build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_CONTROL)
-├── sock.send(&ka)  →  tx_count += 1
-└── Stops: immediately on transition to NodeState::Established
-```
-
-#### Step 2: Node Initiates PQC Handshake (ClientHello)
-
-When the Node receives **any valid M13 frame** from the Hub while in `Registering` state, `process_rx_frame()` returns `RxAction::NeedHandshakeInit`. In practice, this triggers when existing Hub downstream traffic (from other established peers) or the Hub's scheduler output reaches the Node's connected UDP socket. The Node does not wait for a Hub reply to its registration — **any valid M13 frame is sufficient**.
-
-```text
-Node — node/src/main.rs + node/src/cryptography/handshake.rs
-├── process_rx_frame()                                          [main.rs:118]
-│   ├── Validate magic/version                                  [main.rs:134-136]
-│   └── matches!(state, Registering) → RxAction::NeedHandshakeInit [main.rs:139-141]
+├── === PRE-FLIGHT CLEANUP ===
+│   ├── Kill stale m13-hub: pgrep + SIGKILL (exclude self)    [main.rs:141-154]
+│   ├── Detach stale XDP:                                     [main.rs:156-157]
+│   │   ip link set enp1s0f0 xdp off
+│   │   ip link set enp1s0f0 xdpgeneric off
+│   ├── ethtool -L enp1s0f0 combined 1                        [main.rs:162-176]
+│   │   Collapse NIC to single queue so ALL traffic hits queue 0
+│   │   (AF_XDP binds to queue 0; RSS would distribute packets away)
+│   └── Hugepage allocation:                                  [main.rs:178-185]
+│       Write ceil(UMEM_SIZE/2MB) to /proc/sys/vm/nr_hugepages
 │
-├── initiate_handshake()                                        [handshake.rs:22]
-│   ├── MlKem1024::generate(&mut OsRng) → (dk, ek)             [handshake.rs:33]
-│   │   └── ek = 1568 bytes (ML-KEM-1024 encapsulation key)
-│   ├── MlDsa87::key_gen(&mut OsRng) → (sk, pk)                [handshake.rs:37]
-│   │   └── pk = 2592 bytes (ML-DSA-87 verification key)
-│   ├── OsRng::fill_bytes(&mut session_nonce)                   [handshake.rs:44]
-│   │   └── 32 bytes of CSPRNG nonce
-│   ├── Build ClientHello payload:                              [handshake.rs:47-52]
-│   │   ├── type   = HS_CLIENT_HELLO (0x01) ─── 1 byte
-│   │   ├── version = 0x01 ───────────────────── 1 byte
-│   │   ├── nonce ────────────────────────────── 32 bytes
-│   │   ├── ek (ML-KEM-1024) ─────────────────── 1568 bytes
-│   │   └── pk (ML-DSA-87) ──────────────────── 2592 bytes
-│   │   Total: 4194 bytes
-│   │
-│   ├── send_fragmented_udp(src, dst, payload, flags, seq,      [protocol.rs:283]
-│   │                        |frame| { sock.send(frame); })      ← closure-based emit
-│   │   ├── max_chunk = 1402 bytes per fragment
-│   │   ├── FragHeader per chunk: msg_id(2) + index(1) + total(1) + offset(2) + len(2) = 8 bytes
-│   │   ├── Fragment 0/3: bytes [0..1402]
-│   │   ├── Fragment 1/3: bytes [1402..2804]
-│   │   └── Fragment 2/3: bytes [2804..4194]
-│   │
-│   └── Return NodeState::Handshaking {                         [handshake.rs:60-67]
-│       dk_bytes, session_nonce,
-│       client_hello_bytes, our_pk, our_sk, started_ns
-│   }
-```
-
-#### Step 3: Hub Processes ClientHello → Builds ServerHello
-
-The Hub's VPP pipeline reassembles the 3 ClientHello fragments, then processes the complete message: encapsulates the shared secret, signs the transcript, and sends the ServerHello response.
-
-```text
-Hub — hub/src/main.rs + hub/src/cryptography/handshake.rs
-├── VPP Pipeline (per fragment):
-│   ├── rx_parse_raw() → classify_route()                      [datapath.rs:24, 190]
-│   │   └── FLAG_FRAGMENT | FLAG_HANDSHAKE → NextNode::Handshake
-│   └── handle_handshake_packet()                               [main.rs:520+]
-│       ├── Parse FragHeader: msg_id, index, total, offset, len [main.rs:526-537]
-│       └── Assembler::feed(msg_id, index, total, offset, data) [main.rs:540]
-│           └── On fragment 2/3: reassembly complete → returns Vec<u8>
+├── TSC calibration: calibrate_tsc()                          [hub/engine/runtime.rs]
+│   rdtsc loop against CLOCK_MONOTONIC → TscCal{tsc_hz, ns_per_tsc}
 │
-├── process_handshake_message(reassembled, pidx, ctx, stats)    [main.rs:551]
-│   ├── msg_type = data[0] = HS_CLIENT_HELLO (0x01)            [main.rs:558-564]
-│   ├── PeerLifecycle::Handshaking                              [main.rs:565]
-│   │
-│   ├── process_client_hello_hub(data, &mut seq, now)           [handshake.rs:36]
-│   │   ├── Validate: len ≥ 4194, type=0x01, version=0x01      [handshake.rs:41-53]
-│   │   ├── Extract session_nonce [2..34]                       [handshake.rs:57-58]
-│   │   ├── Extract ek_bytes [34..1602]                         [handshake.rs:59]
-│   │   ├── Extract pk_node_bytes [1602..4194]                  [handshake.rs:60]
-│   │   ├── ML-KEM-1024: ek.encapsulate(&mut OsRng) → (ct, ss) [handshake.rs:73]
-│   │   │   ├── ct = 1568 bytes (ciphertext for Node)
-│   │   │   └── ss = 32 bytes (shared secret)
-│   │   ├── ML-DSA-87: key_gen(&mut OsRng) → (sk_hub, pk_hub)  [handshake.rs:83]
-│   │   ├── transcript = SHA-512(ClientHello || ct)             [handshake.rs:87-90]
-│   │   ├── sig_hub = sk_hub.sign(transcript, "M13-HS-v1")     [handshake.rs:92]
-│   │   │   └── 4627 bytes (ML-DSA-87 signature)
-│   │   ├── Build ServerHello payload:                          [handshake.rs:102-106]
-│   │   │   ├── type   = HS_SERVER_HELLO (0x02) ── 1 byte
-│   │   │   ├── ct (ML-KEM-1024) ─────────────── 1568 bytes
-│   │   │   ├── pk_hub (ML-DSA-87) ───────────── 2592 bytes
-│   │   │   └── sig_hub (ML-DSA-87) ──────────── 4627 bytes
-│   │   │   Total: 8788 bytes
-│   │   │
-│   │   └── Return (HubHandshakeState, server_hello_payload)    [handshake.rs:112-119]
-│   │       └── HubHandshakeState stores: node_pk, ss, nonce, CH, SH bytes
-│   │
-│   ├── Transmit ServerHello (UDP path):                        [main.rs:569-590]
-│   │   ├── build_fragmented_raw_udp(src_mac, gw_mac, ...)     [handshake.rs:187]
-│   │   │   └── 7 fragments × (ETH+IP+UDP + ETH+M13+FragHdr+chunk)
-│   │   └── For each fragment:
-│   │       ├── slab.alloc() → slab_idx                        [main.rs:580]
-│   │       ├── memcpy frame → UMEM[slab_idx × frame_size]     [main.rs:583]
-│   │       └── scheduler.enqueue_critical(addr, len)          [main.rs:584]
-│   │           └── Critical priority: bypasses BBRv3 pacing
-│   │
-│   └── peers.hs_sidecar[pidx] = Some(hs_state)               [main.rs:613]
-│       └── Stored for Finished processing in next VPP cycle
-```
-
-#### Step 4: Node Processes ServerHello → Sends Finished
-
-The Node reassembles the 7 ServerHello fragments, decapsulates the shared secret, verifies the Hub's signature, derives the session key, signs the full transcript, and sends the Finished message.
-
-```text
-Node — node/src/main.rs + node/src/cryptography/handshake.rs
-├── CQE Loop (per fragment):
-│   ├── process_rx_frame() → fragment handling                  [main.rs:195-226]
-│   │   ├── Parse FragHeader                                    [main.rs:197-203]
-│   │   └── assembler.feed(msg_id, index, total, offset, data)  [main.rs:206-209]
-│   │       └── On fragment 6/7: reassembly complete
-│   │
-│   └── FLAG_HANDSHAKE set → process_handshake_node()           [main.rs:210-214]
+├── lock_pmu() + fence_interrupts()                           [hub/engine/runtime.rs]
+│   perf_event_open PMU on every core (prevent frequency scaling)
+│   IRQ affinity: move all IRQs off isolated cores
 │
-├── process_handshake_node(reassembled, state)                  [handshake.rs:69]
-│   ├── Validate state == Handshaking (extract dk, nonce, CH)   [handshake.rs:74-82]
-│   ├── Validate: type=0x02, len ≥ 8788                        [handshake.rs:86-100]
-│   ├── Extract ct_bytes [1..1569]                              [handshake.rs:103]
-│   ├── Extract pk_hub_bytes [1569..4161]                       [handshake.rs:104]
-│   ├── Extract sig_hub_bytes [4161..8788]                      [handshake.rs:105]
-│   │
-│   ├── ML-KEM-1024: dk.decapsulate(ct) → ss                   [handshake.rs:120-126]
-│   │   └── 32-byte shared secret (same as Hub's)
-│   ├── transcript = SHA-512(ClientHello || ct)                 [handshake.rs:129-131]
-│   ├── pk_hub.verify(transcript, "M13-HS-v1", sig_hub)        [handshake.rs:147]
-│   │   └── MITM detection: abort if verification fails
-│   │
-│   ├── HKDF-SHA-512(salt=nonce, IKM=ss, info="M13-PQC-SESSION-KEY-v1", L=32)
-│   │   → session_key (32 bytes)                                [handshake.rs:152-156]
-│   │
-│   ├── transcript2 = SHA-512(ClientHello || ServerHello)       [handshake.rs:159-161]
-│   ├── sig_node = sk_node.sign(transcript2, "M13-HS-v1")      [handshake.rs:172]
-│   ├── Build Finished payload:                                 [handshake.rs:179-181]
-│   │   ├── type    = HS_FINISHED (0x03) ─── 1 byte
-│   │   └── sig_node (ML-DSA-87) ────────── 4627 bytes
-│   │   Total: 4628 bytes
-│   │
-│   └── Return Some((session_key, finished_payload))
+├── discover_isolated_cores()                                 [hub/engine/runtime.rs]
+│   Parse /sys/devices/system/cpu/isolated or M13_MOCK_CMDLINE
 │
-├── RxAction::HandshakeComplete handling:                       [main.rs:987-1011]
-│   ├── send_fragmented_udp(..., finished, flags, seq,          [main.rs:989-993]
-│   │                        |frame| { sock.send(frame); })     ← closure-based emit
-│   │   └── 4 fragments (⌈4628/1402⌉)
-│   ├── NodeState::Established {                                [main.rs:998-1005]
-│   │   session_key,
-│   │   cipher: LessSafeKey::new(AES_256_GCM, &session_key),
-│   │   frame_count: 0,
-│   │   established_ns: now,
-│   │ }
-│   └── setup_tunnel_routes(&hub_ip)                            [main.rs:1008]
-│       ├── ip route add default dev m13tun0 table 100
-│       ├── ip rule add from all lookup 100
-│       └── Enables: all IP traffic → TUN → AEAD → UDP → Hub
-```
-
-#### Step 5: Hub Processes Finished → Session Established
-
-The Hub reassembles the 4 Finished fragments, verifies the Node's signature over the full transcript, derives the identical session key via HKDF, and installs the AES-256-GCM cipher for bidirectional AEAD.
-
-```text
-Hub — hub/src/main.rs + hub/src/cryptography/handshake.rs
-├── Fragment reassembly (same VPP path as Step 3)
-│   └── Assembler::feed() × 4 → reassembly complete
+├── worker_count = 1 (single-queue mode)
 │
-├── process_handshake_message() → HS_FINISHED branch           [main.rs:621]
-│   ├── Retrieve hs_state from peers.hs_sidecar[pidx]         [main.rs:622]
-│   │
-│   ├── process_finished_hub(data, hs_state)                   [handshake.rs:125]
-│   │   ├── Validate: type=0x03, len ≥ 4628                   [handshake.rs:129-137]
-│   │   ├── Extract sig_node_bytes [1..4628]                   [handshake.rs:141]
-│   │   ├── transcript2 = SHA-512(CH || SH)                    [handshake.rs:143-146]
-│   │   │   └── Using stored client_hello_bytes + server_hello_bytes
-│   │   ├── pk_node.verify(transcript2, "M13-HS-v1", sig_node) [handshake.rs:167]
-│   │   │   └── MITM detection: abort if verification fails
-│   │   ├── HKDF-SHA-512(salt=nonce, IKM=ss, info="M13-PQC-SESSION-KEY-v1", L=32)
-│   │   │   → session_key (32 bytes)                           [handshake.rs:174-177]
-│   │   └── Return Some(session_key)
-│   │
-│   ├── Install session:                                       [main.rs:624-631]
-│   │   ├── peers.slots[pidx].session_key = key
-│   │   ├── peers.ciphers[pidx] = LessSafeKey::new(AES_256_GCM, &key)
-│   │   ├── peers.slots[pidx].frame_count = 0
-│   │   ├── peers.slots[pidx].lifecycle = PeerLifecycle::Established
-│   │   └── peers.hs_sidecar[pidx] = None  (free handshake state)
-│   │
-│   └── stats.handshake_ok += 1
-│       └── Telemetry: HS:1/0 (ok/fail)
+├── BpfSteersman::load_and_attach("enp1s0f0")                [hub/network/bpf.rs]
+│   ├── Read BPF_OBJECT_PATH (set by build.rs)
+│   ├── bpf_object__open_file() → bpf_object__load()
+│   ├── m13_steersman XDP program:                            [hub/build.rs:44-77]
+│   │   Path 1: EtherType 0x88B5 → bpf_redirect_map(xsks_map) [raw L2 M13]
+│   │   Path 2: IPv4 UDP dst port 443 → bpf_redirect_map     [UDP-encaps M13]
+│   │   Default: XDP_PASS (SSH, ARP, etc. to kernel stack)
+│   ├── bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE)
+│   │   Fallback: XDP_FLAGS_SKB_MODE if driver mode fails
+│   └── xsks_map fd returned for AF_XDP socket registration
+│
+├── create_tun("m13tun0")                                     [hub/network/datapath.rs]
+│   ioctl(TUNSETIFF, IFF_TUN | IFF_NO_PI) → TUN fd
+│
+├── setup_nat()                                               [hub/network/datapath.rs]
+│   ├── ip link set m13tun0 up
+│   ├── ip addr add 10.13.0.1/24 dev m13tun0
+│   ├── sysctl net.ipv4.ip_forward = 1
+│   ├── iptables -t nat -A POSTROUTING -s 10.13.0.0/24 -j MASQUERADE
+│   ├── iptables -A FORWARD -i m13tun0 -j ACCEPT
+│   ├── iptables -A FORWARD -o m13tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+│   └── System buffer tuning: sysctl rmem_max/wmem_max/netdev_max_backlog/rmem_default/wmem_default
+│
+├── SPSC Ring Creation (4 rings × depth 2048):                [main.rs:218-227]
+│   tx_tun:      Producer<PacketDesc> → Consumer<PacketDesc>  (datapath → TUN HK)
+│   rx_tun:      Producer<PacketDesc> → Consumer<PacketDesc>  (TUN HK → datapath)
+│   free_to_tun: Producer<u32> → Consumer<u32>                (datapath → TUN HK: slab IDs)
+│   free_to_dp:  Producer<u32> → Consumer<u32>                (TUN HK → datapath: slab IDs)
+│   All rings from hub/engine/spsc.rs: lock-free, cache-aligned, power-of-two
+│
+├── OnceLock<(usize, u32)> for UMEM base sharing              [main.rs:232-233]
+│   Worker 0 publishes (umem_base_ptr, frame_size) after Engine::new()
+│   TUN HK thread blocks on .get() until published
+│
+├── TUN Housekeeping Thread spawn                              [main.rs:236-254]
+│   Pinned to last isolated core
+│   tun_housekeeping_thread():                                [main.rs:757-940]
+│   ├── Blocks until umem_info.get() returns (Worker 0 must start first)
+│   ├── DPDK-style local cache: [u32; 4096] pending_return
+│   └── Main loop:
+│       ├── Phase 0: Drain pending_return → free_slab_tx.push_batch()
+│       ├── Phase 1 (TX to kernel): Pop PacketDesc from rx_from_dp →
+│       │   write(tun_fd, payload) → return slab ID to free_slab_tx
+│       └── Phase 2 (RX from kernel): poll(POLLIN, 1ms) →
+│           alloc from free_slab_rx → read(tun_fd) →
+│           build ETH+M13 header in UMEM → push PacketDesc to tx_to_dp
+│
+├── Worker 0 handle distribution via .take()                   [main.rs:262-278]
+│   Only worker 0 gets SPSC Producer/Consumer handles
+│
+└── worker_entry() spawned on isolated core                    [main.rs:942-1542]
+    ├── pin_to_core(core_id) + verify_affinity()              [hub/engine/runtime.rs]
+    ├── Telemetry::map_worker() → /dev/shm mmap               [hub/engine/runtime.rs]
+    │
+    ├── Engine::new_zerocopy(if_name, queue_id, bpf_map_fd)    [hub/network/xdp.rs]
+    │   ├── HugeTLB mmap for UMEM (2MB hugepages)
+    │   ├── xsk_socket__create_shared() → AF_XDP socket
+    │   ├── bpf_map_update_elem(xsks_map, queue_id, xsk_fd)
+    │   └── Fill Ring, Completion Ring, RX Ring, TX Ring initialized
+    │
+    ├── Worker 0: umem_info.set() → unblock TUN HK thread     [main.rs:962-966]
+    │
+    ├── FixedSlab::new(8192)                                   [hub/engine/runtime.rs]
+    │   Bitmap-based O(1) allocator for UMEM frame indices
+    │
+    ├── Scheduler::new() — dual-queue (critical/bulk) + EDT    [hub/engine/protocol.rs]
+    ├── PeerTable::new(epoch_ns) — 256 slots + assemblers      [hub/engine/protocol.rs]
+    │   Each slot: PeerSlot(64B align), Scheduler, ReceiverState, JitterBuffer,
+    │   Assembler(8 HugeTLB AssemblySlots), cipher, hs_sidecar
+    ├── ReceiverState::new() + RxBitmap::new()                 [hub/engine/protocol.rs]
+    │
+    ├── Detect hub_ip from interface, resolve gateway_mac       [hub/network/datapath.rs]
+    │   get_interface_ip() + resolve_gateway_mac() (ARP table parse)
+    │
+    ├── Pre-stamp ALL 8192 slab frames with ETH+M13 headers    [main.rs:1007-1022]
+    │   dst=[0xFF;6], src=iface_mac, ethertype=0x88B5(BE),
+    │   magic=0xD1, version=0x01, seq=0, flags=0
+    │
+    ├── measure_epsilon_proc() → processing jitter floor        [hub/engine/protocol.rs]
+    ├── JitterBuffer::new()                                    [hub/engine/protocol.rs]
+    │   RFC 3550 EWMA Q60.4 fixed-point jitter estimator
+    │   Circular release buffer, JBUF_CAPACITY=128
+    │
+    ├── PQC Arena Allocation:                                  [main.rs:1052-1064]
+    │   payload_arena: [[0u8; 9216]; MAX_PEERS] → leaked *mut
+    │     (datapath writes reassembled handshake, Core 0 reads)
+    │   hs_state_arena: [FlatHubHandshakeState; MAX_PEERS] → leaked *mut
+    │     (Core 0 local: stores inter-message handshake state)
+    │
+    ├── PQC SPSC Rings (2 × depth 128):                        [hub/cryptography/async_pqc.rs]
+    │   pqc_req: Producer<PqcReq> → Consumer<PqcReq>           (datapath → Core 0)
+    │   pqc_resp: Producer<PqcResp> → Consumer<PqcResp>        (Core 0 → datapath)
+    │
+    ├── PQC Control Plane Thread spawn on Core 0:               [main.rs:1070-1081]
+    │   pqc_worker_thread(): Pop PqcReq → process ClientHello/Finished → push PqcResp
+    │   Runs ML-KEM-1024 + ML-DSA-87 (~10ms+5ms) OFF the datapath
+    │
+    ├── EdtPacer::new(cal, 100_000_000)                         [hub/network/uso_pacer.rs]
+    │   Zero-spin EDT pacer, 100 Mbps default MANET link rate
+    │   per-byte pacing: delay_ns = frame_bytes × ns_per_byte
+    │
+    └── ═══ VPP Main Loop ═══                                 [main.rs:1094-1530]
+        │
+        ├── SHUTDOWN check → graceful close:                   [main.rs:1097-1131]
+        │   3× FIN burst to all Established peers via
+        │   send_fin_burst_udp() or send_fin_burst_l2()
+        │   Then RX-only until FIN-ACK or deadline
+        │
+        ├── engine.recycle_tx() + engine.refill_rx()           [hub/network/xdp.rs]
+        │   Reclaim completed TX descriptors, refill RX ring
+        │
+        ├── TX Graph (worker 0 only):                          [main.rs:1140-1178]
+        │   execute_tx_graph() → [hub/main.rs:651-755]
+        │   ├── Reclaim returned slabs: free_to_dp_cons.pop_batch() → slab.free()
+        │   ├── Demand-driven slab provision: free_to_tun_prod.push_batch()
+        │   └── Pop TUN frames: rx_tun_cons.pop_batch() →
+        │       lookup_by_tunnel_ip() → seal_frame() → build_fragmented_raw_udp()
+        │       EDT pacer.pace() → enqueue_bulk_edt() with release_ns timestamp
+        │
+        ├── Telemetry: 1/sec report                            [main.rs:1180-1196]
+        │
+        ├── STAGE 0: Adaptive batch drain                      [main.rs:1198-1207]
+        │   engine.poll_rx_batch() → xdp_desc[] (up to GRAPH_BATCH=256)
+        │   Coalesce loop: gather until 256 or DEADLINE_NS (50µs)
+        │
+        ├── STAGE 0.5: Jitter buffer drain                     [main.rs:1209-1222]
+        │   jbuf.drain(now_ns, scheduler) → release buffered frames
+        │
+        ├── VPP Graph Executor:                                [main.rs:1224-1418]
+        │   execute_graph(rx_descs, GraphCtx)                  [main.rs:340-379]
+        │   └── execute_subvector() per 64-packet chunk:       [main.rs:381-552]
+        │       ├── rx_parse_raw() → PacketVector              [hub/network/datapath.rs]
+        │       │   Validates magic, version, crypto_ver routing:
+        │       │   crypto_ver=0x00 → cleartext_out (handshake/control)
+        │       │   crypto_ver=0x01 → decrypt_out  (AEAD encrypted)
+        │       │   Learns hub_ip/gateway_mac from first inbound
+        │       │
+        │       ├── aead_decrypt_vector()                      [hub/network/datapath.rs]
+        │       │   Per-packet: peer lookup → open_frame() with peer cipher
+        │       │   Reflection guard: nonce[0] ≠ DIR_HUB_TO_NODE
+        │       │
+        │       ├── classify_route() → Disposition             [hub/network/datapath.rs]
+        │       │   Priority routing (first match wins):
+        │       │   FLAG_FIN       → Consumed (FIN deferred to post-executor)
+        │       │   FLAG_FEEDBACK  → Feedback
+        │       │   FLAG_FRAGMENT  → Handshake
+        │       │   FLAG_HANDSHAKE → Handshake
+        │       │   FLAG_CONTROL   → Consumed (echo, keepalive)
+        │       │   FLAG_TUNNEL    → TunWrite
+        │       │   default        → TxEnqueue (data forward)
+        │       │
+        │       ├── scatter()                                  [hub/network/mod.rs]
+        │       │   4-wide prefetch scatter into per-NextNode output vectors
+        │       │
+        │       ├── Handshake fragments:                       [main.rs:554-649]
+        │       │   process_fragment() →
+        │       │     typestate validate_frag_index() + validate_frag_data_bounds()
+        │       │     Assembler.feed() →
+        │       │     process_handshake_message() →
+        │       │       Copy payload into payload_arena[pidx]
+        │       │       Push PqcReq to Core 0 via pqc_req SPSC
+        │       │
+        │       ├── tun_write_vector()                         [hub/network/datapath.rs]
+        │       │   Push PacketDesc to SPSC tx_tun ring → TUN HK thread
+        │       │   (worker 0 only; other workers: direct write(tun_fd))
+        │       │
+        │       └── CycleStats accumulation → Telemetry SHM
+        │
+        ├── FIN processing (deferred from executor):           [main.rs:1309-1338]
+        │   FIN received → send_fin_burst_*() FIN-ACK → evict peer
+        │   FIN-ACK received → clear deadline, close complete
+        │
+        ├── Registration echo processing:                      [main.rs:1340-1417]
+        │   For each non-Established peer:
+        │   100ms throttle → build Echo (FLAG_CONTROL) →
+        │   build_raw_udp_frame() or raw L2 → enqueue_critical()
+        │   Slab leak prevention: free on enqueue failure
+        │
+        ├── STAGE 3: Feedback generation                       [main.rs:1422, main.rs:310-336]
+        │   stage_feedback_gen() if needs_feedback(pkt_since_feedback ≥ 32)
+        │   produce_feedback_frame() → 102B → enqueue_critical()
+        │
+        ├── V4: PQC Response Drain                             [main.rs:1424-1516]
+        │   Pop PqcResp batch from pqc_resp_cons:
+        │   ├── msg_type=0x02 (ServerHello):
+        │   │   Frame payload with local hub_ip/gateway_mac
+        │   │   build_fragmented_raw_udp() or build_fragmented_l2()
+        │   │   → enqueue_critical() (handshake frames are priority)
+        │   └── msg_type=0x03 (SessionEstablished):
+        │       Install AES-256-GCM LessSafeKey in peers.ciphers[pidx]
+        │       PeerLifecycle::Established, alloc_tunnel_ip()
+        │       Clear hs_sidecar
+        │
+        ├── STAGE 6: Schedule TX                               [main.rs:1518-1523]
+        │   scheduler.schedule(tx_path, now_ns):
+        │   EDT-gated dequeue: critical-first, then bulk
+        │   Won't release frames before release_ns timestamp
+        │   tx_path.stage_tx_addr() → tx_path.commit_tx() → kick_tx()
+        │
+        └── Periodic GC (every 10,000 cycles):                 [main.rs:1524-1529]
+            peers.gc() + assembler.gc() per peer
+
+═══ HUB IS NOW IDLE, VPP LOOP POLLING, WAITING FOR INBOUND NODE PACKETS ═══
 ```
 
-#### Step 6: Bidirectional AEAD Tunnel Active
+### Phase 2: Node Connection
 
-Both sides now have identical AES-256-GCM session keys derived from the same ML-KEM shared secret via HKDF-SHA-512. All subsequent tunnel data is encrypted/authenticated.
+**Command:** `sudo RUST_LOG=debug ./target/release/m13-node --hub-ip 206.223.224.25:443 --tunnel`
 
 ```text
-Upstream (Node → Hub):
-  TUN read → build_m13_frame(FLAG_TUNNEL) → seal_frame(cipher, seq, DIR_NODE_TO_HUB)
-  → crypto_ver=0x01 stamped → sock.send() → UDP → Hub
-  → Hub rx_parse_raw() → crypto_ver=0x01 → decrypt_out → aead_decrypt_vector()
-  → open_frame(cipher, DIR_HUB_TO_NODE) → FLAG_TUNNEL → TunWrite → SPSC → TUN write
+main()                                                        [node/src/main.rs:37]
+├── Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN     [main.rs:42-44]
+├── Panic hook: nuke_cleanup_node()                            [main.rs:48-52]
+│   Calls: nuke_cleanup("m13tun0", hub_ip)                    [node/network/datapath.rs]
+│   Idempotent: ip route del, ip link del, iptables flush
+│
+├── CLI parse:                                                 [main.rs:54-74]
+│   echo = false, hexdump = false, tunnel = true
+│   hub_ip = Some("206.223.224.25:443")
+│
+├── create_tun("m13tun0")                                      [node/network/datapath.rs]
+│   ioctl(TUNSETIFF, IFF_TUN | IFF_NO_PI) → File
+│
+├── Store hub IP in HUB_IP_GLOBAL Mutex                        [main.rs:78-79]
+│   (for panic hook route teardown)
+│
+└── run_uring_worker("206.223.224.25:443", false, false, Some(tun))  [main.rs:81]
 
-Downstream (Hub → Node):
-  TUN read → SPSC → tun_read_batch() → seal_frame(cipher, seq, DIR_HUB_TO_NODE)
-  → build_raw_udp_frame() → AF_XDP TX → UDP → Node
-  → Node CQE (TAG_UDP_RECV_MULTISHOT) → batch decrypt_batch_ptrs()
-  → open_frame(cipher, DIR_NODE_TO_HUB) → FLAG_TUNNEL → TunWrite → io_uring write
+run_uring_worker()                                             [node/src/main.rs:723]
+├── TSC calibration: calibrate_tsc()                           [node/engine/runtime.rs]
+│
+├── tune_system_buffers()                                      [main.rs:274-330]
+│   sysctl: net.core.rmem_max, wmem_max, netdev_max_backlog,
+│   rmem_default, wmem_default (all to 4MB+)
+│
+├── UdpSocket::bind("0.0.0.0:0") → connect(hub_addr)          [main.rs]
+│   O_NONBLOCK, SO_RCVBUFFORCE=8MB, SO_SNDBUFFORCE=8MB
+│
+├── UringReactor::new(raw_fd, cpu=0)                           [node/network/uring_reactor.rs]
+│   ├── HugeTLB mmap: 2MB-aligned arena (PBR metadata + data frames)
+│   ├── IoUring::builder()
+│   │   .setup_sqpoll(2000ms)        SQPOLL kernel thread, 2s idle timeout
+│   │   .setup_single_issuer()       Single-thread SQ ownership
+│   ├── SYS_io_uring_register IORING_REGISTER_PBUF_RING
+│   │   Register Provided Buffer Ring with kernel
+│   ├── Pre-register all BIDs in PBR
+│   └── arm_multishot_recv()
+│       Single SQE IORING_OP_RECV with IOSQE_BUFFER_SELECT + MULTISHOT
+│       Survives for lifetime of socket (no per-packet SQE submission)
+│
+├── Arm TUN reads: BIDs in [UDP_RING_ENTRIES .. TOTAL_BIDS)
+│
+├── Assembler::init(alloc_asm_arena())                         [node/engine/protocol.rs]
+│   8 AssemblySlots × 9280B per slot (HugeTLB arena)
+│
+├── Build M13 header template                                  [node/engine/protocol.rs]
+│   detect_mac(None) → LAA random MAC
+│   src_mac, hub_mac=[0xFF;6], magic=0xD1, version=0x01
+│
+├── ══════════════════════════════════════════════════════════
+│   STEP 1: REGISTRATION
+│   ══════════════════════════════════════════════════════════
+│   build_m13_frame(src_mac, hub_mac, seq=0, flags=0x00)       [node/engine/protocol.rs:61]
+│   → 62-byte frame: ETH(14) + M13(48), all zeroes payload
+│   sock.send(&frame)                                          [main.rs]
+│   NodeState::Registering                                     [node/engine/runtime.rs]
+│
+│   Hub receives:
+│   rx_parse_raw() → cleartext_out (crypto_ver=0x00)
+│   classify_route() → Consumed (flags=0x00, no flag match → TxEnqueue but no session)
+│   lookup_or_insert(PeerAddr::Udp{ip, port}, src_mac) → PeerSlot allocated
+│   PeerLifecycle::Registered
+│   Reconnection guard: if same source IP exists with different port, evict stale
+│
+│   Hub responds with Echo:
+│   100ms throttled, build_raw_udp_frame(FLAG_CONTROL) → enqueue_critical()
+│
+└── ═══ CQE Three-Pass Main Loop ═══                          [main.rs]
+    │
+    ├── SHUTDOWN check + 30s connection timeout                [main.rs]
+    │
+    ├── ══════════════════════════════════════════════════════
+    │   STEP 2: NODE RECEIVES ECHO → INITIATES HANDSHAKE
+    │   ══════════════════════════════════════════════════════
+    │   CQE Pass 0: TAG_UDP_RECV_MULTISHOT → recv frame
+    │   Pass 2: process_rx_frame() scans flags:
+    │     flags=FLAG_CONTROL, state=Registering
+    │     → RxAction::NeedHandshakeInit
+    │
+    │   initiate_handshake():                                  [node/cryptography/handshake.rs]
+    │   ├── OsRng → client_nonce (32 bytes)
+    │   ├── ML-KEM-1024 KeyGen → (dk_node, ek_node)            [ml-kem crate]
+    │   │   ek_node = 1568 bytes (encapsulation key)
+    │   │   dk_node = decapsulation key (stored in NodeHandshakeState)
+    │   ├── ML-DSA-87 KeyGen → (sk_node, pk_node)              [ml-dsa crate]
+    │   │   pk_node = 2592 bytes (verification key)
+    │   │   sk_node = signing key (stored in NodeHandshakeState)
+    │   └── Build ClientHello payload (4194B):
+    │       [0] = HS_CLIENT_HELLO (0x01)
+    │       [1] = version (0x01)
+    │       [2..34] = client_nonce
+    │       [34..1602] = ek_node (ML-KEM-1024 encapsulation key)
+    │       [1602..4194] = pk_node (ML-DSA-87 verification key)
+    │
+    │   send_fragmented_udp(payload, flags=FLAG_CONTROL|FLAG_HANDSHAKE)
+    │     k = ceil(4194/1402) = 3 systematic fragments
+    │     Each fragment: ETH(14) + M13(48) + FragHdr(8) + chunk(≤1402)
+    │   NodeState::Handshaking
+    │
+    ├── ══════════════════════════════════════════════════════
+    │   STEP 3: HUB PROCESSES CLIENT HELLO
+    │   ══════════════════════════════════════════════════════
+    │   Hub VPP loop receives 3 fragments:
+    │   rx_parse_raw() → cleartext_out (crypto_ver=0x00, handshake)
+    │   classify_route(): FLAG_FRAGMENT → NextNode::Handshake
+    │   scatter() → handshake_out vector
+    │
+    │   process_fragment():                                    [hub/main.rs:554-596]
+    │   ├── typestate::validate_frag_index(index, total)       [hub/engine/typestate.rs]
+    │   │   Branchless: (index >= total) as usize → panic-free clamp
+    │   ├── typestate::validate_frag_data_bounds(offset, len)  [hub/engine/typestate.rs]
+    │   │   Branchless OOB check preventing adversarial slice
+    │   └── peers.assemblers[pidx].feed(msg_id, index, total, offset, data)
+    │       On completion (all 3 fragments received):
+    │       → process_handshake_message(reassembled_4194B)
+    │
+    │   process_handshake_message():                            [hub/main.rs:598-649]
+    │   ├── reassembled[0] = HS_CLIENT_HELLO (0x01)
+    │   ├── Copy 4194B into payload_arena[pidx]
+    │   │   (shared memory: datapath writes, Core 0 reads)
+    │   ├── Push PqcReq{pidx, msg_type=0x01, payload_len=4194}
+    │   │   to pqc_req SPSC ring
+    │   └── PeerLifecycle::Handshaking
+    │
+    │   Core 0 PQC Worker Thread:                              [hub/cryptography/async_pqc.rs]
+    │   pqc_worker_thread() pops PqcReq:
+    │   ├── Reads payload from payload_arena[pidx]
+    │   ├── process_client_hello_hub(payload):                 [hub/cryptography/handshake.rs]
+    │   │   ├── Validate: len ≥ 4194, type=0x01, version=0x01
+    │   │   ├── Parse: nonce(32B), ek_node(1568B), pk_node(2592B)
+    │   │   ├── ML-KEM-1024 Encapsulate(ek_node) → (ct, shared_secret)
+    │   │   │   ct = 1568 bytes (ciphertext)
+    │   │   │   shared_secret = 32 bytes
+    │   │   ├── ML-DSA-87 KeyGen → (sk_hub, pk_hub)
+    │   │   │   pk_hub = 2592 bytes
+    │   │   ├── Transcript hash: SHA-512(client_nonce || ct || pk_hub)
+    │   │   ├── ML-DSA-87 sign_deterministic(sk_hub, transcript)
+    │   │   │   → sig_hub = 4627 bytes
+    │   │   ├── Build ServerHello (8788B):
+    │   │   │   [0] = HS_SERVER_HELLO (0x02)
+    │   │   │   [1..1569] = ct
+    │   │   │   [1569..4161] = pk_hub
+    │   │   │   [4161..8788] = sig_hub
+    │   │   └── Store HubHandshakeState{shared_secret, pk_node, transcript, pk_hub}
+    │   │
+    │   └── Push PqcResp{pidx, msg_type=0x02, response=ServerHello(8788B), success=1}
+    │
+    │   Back on datapath (PQC Response Drain):                 [hub/main.rs:1424-1496]
+    │   ├── Pop PqcResp, msg_type=0x02
+    │   ├── Frame ServerHello with local hub_ip/gateway_mac
+    │   ├── build_fragmented_raw_udp():                        [hub/engine/protocol.rs]
+    │   │   k = ceil(8788/1402) = 7 systematic fragments
+    │   │   Each: ETH(14) + IP(20) + UDP(8) + M13_FRAG
+    │   └── enqueue_critical() for each fragment (priority TX)
+    │
+    ├── ══════════════════════════════════════════════════════
+    │   STEP 4: NODE PROCESSES SERVER HELLO
+    │   ══════════════════════════════════════════════════════
+    │   Node CQE loop receives 7 fragments:
+    │   Pass 2: process_rx_frame():                            [node/main.rs:112-255]
+    │   ├── flags & FLAG_FRAGMENT → Assembler.feed()
+    │   │   7 fragments → reassemble 8788B ServerHello
+    │   ├── reassembled[0] = HS_SERVER_HELLO (0x02)
+    │   ├── process_server_hello_node():                       [node/cryptography/handshake.rs]
+    │   │   ├── Parse: ct(1568B), pk_hub(2592B), sig_hub(4627B)
+    │   │   ├── Transcript hash: SHA-512(client_nonce || ct || pk_hub)
+    │   │   ├── ML-DSA-87 verify_with_context(pk_hub, transcript, sig_hub)
+    │   │   │   → Verify hub identity (prevents MITM)
+    │   │   ├── ML-KEM-1024 Decapsulate(dk_node, ct) → shared_secret
+    │   │   ├── HKDF-SHA-512(salt=client_nonce, IKM=shared_secret,
+    │   │   │     info="M13-PQC-SESSION-KEY-v1", L=32)
+    │   │   └── Return NodeHandshakeResult{session_key, pk_hub, transcript}
+    │   │
+    │   ├── Install AES-256-GCM cipher: LessSafeKey::new(session_key)
+    │   ├── Build Finished message (4628B):
+    │   │   [0] = HS_FINISHED (0x03)
+    │   │   [1..4628] = ML-DSA-87 sign_deterministic(sk_node, transcript)
+    │   │               = sig_node (4627 bytes)
+    │   │
+    │   ├── send_fragmented_udp(Finished, FLAG_CONTROL|FLAG_HANDSHAKE)
+    │   │   k = ceil(4628/1402) = 4 systematic fragments
+    │   │
+    │   ├── NodeState::Established                             [node/engine/runtime.rs]
+    │   │
+    │   └── setup_tunnel_routes(hub_ip):                       [node/network/datapath.rs]
+    │       ├── ip addr add 10.13.0.2/24 dev m13tun0
+    │       ├── ip link set m13tun0 up
+    │       ├── Detect default gateway via ip route show default
+    │       ├── ip route add <hub_ip>/32 via <gateway>         [preserve Hub reachability]
+    │       ├── ip route add 0.0.0.0/1 dev m13tun0             [split-default routing]
+    │       ├── ip route add 128.0.0.0/1 dev m13tun0           [covers all IPs, overrides default]
+    │       ├── Disable IPv6: net.ipv6.conf.all.disable_ipv6=1
+    │       ├── iptables -t nat -A POSTROUTING -o m13tun0 -j MASQUERADE
+    │       ├── MSS clamping: iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN
+    │       │   -j TCPMSS --clamp-mss-to-pmtu
+    │       ├── TCP BDP tuning: sysctl net.ipv4.tcp_wmem/rmem max=16MB
+    │       └── tc qdisc replace dev m13tun0 root fq
+    │
+    ├── ══════════════════════════════════════════════════════
+    │   STEP 5: HUB PROCESSES FINISHED
+    │   ══════════════════════════════════════════════════════
+    │   Hub receives 4 fragments → Assembler → reassemble 4628B
+    │   process_handshake_message():
+    │   ├── reassembled[0] = HS_FINISHED (0x03)
+    │   ├── Copy into payload_arena[pidx]
+    │   └── Push PqcReq{pidx, msg_type=0x03} to Core 0
+    │
+    │   Core 0: process_finished_hub():                        [hub/cryptography/handshake.rs]
+    │   ├── Parse: sig_node (4627B)
+    │   ├── ML-DSA-87 verify_with_context(pk_node, transcript, sig_node)
+    │   │   → Verify node identity (mutual authentication)
+    │   ├── HKDF-SHA-512(salt=session_nonce, IKM=shared_secret,
+    │   │     info="M13-PQC-SESSION-KEY-v1", L=32)
+    │   └── Push PqcResp{pidx, msg_type=0x03, session_key, success=1}
+    │
+    │   Datapath PQC drain:                                    [hub/main.rs:1497-1512]
+    │   ├── Install AES-256-GCM: LessSafeKey::new(session_key)
+    │   │   into peers.ciphers[pidx]
+    │   ├── peers.slots[pidx].lifecycle = PeerLifecycle::Established
+    │   ├── alloc_tunnel_ip() → 10.13.0.X (bitmap allocator)
+    │   └── Clear hs_sidecar[pidx]
+    │
+    ├── ══════════════════════════════════════════════════════
+    │   STEP 6: AEAD TUNNEL — STEADY STATE
+    │   ══════════════════════════════════════════════════════
+    │
+    │   === UPSTREAM (Node → Hub) ===
+    │   Node CQE loop:
+    │   ├── TUN read (CQE TAG_TUN_READ):
+    │   │   Build M13 header in-place over HugeTLB buffer
+    │   │   seal_frame(buf, cipher, seq, DIR_NODE_TO_HUB)      [node/cryptography/aead.rs]
+    │   │   stage_udp_send() → io_uring SQE
+    │   │
+    │   ├── Batch path (encrypt_batch_ptrs):                   [node/cryptography/aead.rs]
+    │   │   4-at-a-time prefetch → saturate AES-NI/ARMv8-CE pipeline
+    │   │   Each frame sealed individually with monotonic seq
+    │   │
+    │   Hub VPP graph:
+    │   ├── rx_parse_raw(): crypto_ver=0x01 → decrypt_out
+    │   ├── aead_decrypt_vector(): open_frame(peer cipher, DIR_HUB_TO_NODE)
+    │   │   Reflection guard: nonce[0]=0x01 ≠ 0x00 → passes
+    │   ├── classify_route(): FLAG_TUNNEL → TunWrite
+    │   ├── tun_write_vector() → SPSC push to TUN HK thread
+    │   └── TUN HK: write(tun_fd, decrypted IP payload) → kernel routing
+    │
+    │   === DOWNSTREAM (Hub → Node) ===
+    │   Hub TUN HK thread:
+    │   ├── poll(POLLIN) → read(tun_fd) → IP packet from internet
+    │   ├── Build ETH+M13 header in UMEM slab
+    │   └── Push PacketDesc to rx_tun SPSC ring
+    │
+    │   Hub datapath (execute_tx_graph):                        [hub/main.rs:651-755]
+    │   ├── Pop from rx_tun_cons → encrypted packets
+    │   ├── lookup_by_tunnel_ip(dst_ip) → peer index
+    │   ├── seal_frame(buf, cipher, seq, DIR_HUB_TO_NODE, offset)
+    │   │   offset=42 for UDP peers (ETH+IP+UDP header space)
+    │   │   offset=14 for L2 peers (ETH header only)
+    │   ├── build_fragmented_raw_udp() if payload > 1402B
+    │   │   k systematic fragments (no parity — FEC removed)
+    │   ├── EDT pacer.pace(frame_bytes) → release_ns           [hub/network/uso_pacer.rs]
+    │   └── scheduler.enqueue_bulk_edt(addr, len, release_ns)
+    │
+    │   Hub scheduler.schedule():                              [hub/engine/protocol.rs:1180]
+    │   EDT-gated dequeue: won't release before release_ns
+    │   Critical queue drained first (handshakes, feedback, FIN)
+    │   tx_path.stage_tx_addr() → tx_path.commit_tx() → kick_tx()
+    │
+    │   Node receives:
+    │   ├── CQE Pass 1: decrypt_batch_ptrs()                   [node/cryptography/aead.rs]
+    │   │   Scan recv frames for crypto_flag=0x01 → collect enc_ptrs[]
+    │   │   4-at-a-time prefetch → batch AES-256-GCM open
+    │   │   Stamp PRE_DECRYPTED_MARKER (0x02) at signature[2] on success
+    │   │
+    │   ├── CQE Pass 2: process_rx_frame()                     [node/main.rs:112-255]
+    │   │   PRE_DECRYPTED_MARKER check → skip scalar re-decrypt
+    │   │   FLAG_TUNNEL → RxAction::TunWrite
+    │   │   stage_tun_write(tun_fd, payload_ptr, payload_len, bid)
+    │   │   BID recycled to PBR after kernel consumes TUN write CQE
+    │   │
+    │   └── Rekey check: frame_count ≥ REKEY_FRAME_LIMIT (2³²)
+    │       OR elapsed ≥ REKEY_TIME_LIMIT_NS (1 hour)
+    │       → RxAction::RekeyNeeded → NodeState::Registering → restart from Step 1
+    │
+    ├── ══════════════════════════════════════════════════════
+    │   STEP 7: FAILURE & RECOVERY
+    │   ══════════════════════════════════════════════════════
+    │
+    │   Handshake timeout:
+    │   ├── Node: 250ms micro-ARQ retransmit ClientHello/Finished
+    │   │   via send_fragmented_udp() (HANDSHAKE_RETX_INTERVAL_NS)
+    │   ├── Node: 30s total connection timeout → exit
+    │   ├── Hub: Assembler GC every 5 telemetry ticks
+    │   │   5-second stale fragment expiry
+    │   │
+    │   Graceful close (SIGTERM/SIGINT):
+    │   ├── Hub: 3× FIN burst to all Established peers
+    │   │   send_fin_burst_udp() / send_fin_burst_l2()
+    │   │   RX-only loop until FIN-ACK or 5× RTT deadline
+    │   ├── Node: receives FIN → RxAction::Drop (peer evicted)
+    │   │   nuke_cleanup_node() on exit
+    │   └── Hub: nuke_cleanup_hub() on exit
+    │
+    │   AEAD failure:
+    │   ├── Hub: open_frame() returns false → CycleStats.aead_fail++
+    │   │   Packet silently dropped (no response to attacker)
+    │   └── Node: decrypt fails → aead_fail_count++
+    │       After threshold: RxAction::RekeyNeeded
+    │
+    ├── Re-arm multishot recv if terminated (CQE_F_MORE==0)
+    ├── Keepalive: 100ms interval, pre-Established only
+    ├── Assembler GC: every 5 telemetry ticks (5-second stale expiry)
+    └── Telemetry: 1/sec:
+        RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{} Up:{}s
 ```
-
-#### Step 7: Failure Recovery
-
-```text
-Handshake Timeout (5s):                                         [main.rs:591-601 / 1033-1042]
-  NodeState::Handshaking.started_ns + HANDSHAKE_TIMEOUT_NS exceeded
-  → Re-send registration (FLAG_CONTROL)
-  → assembler.clear_all() (flush stale fragments, arena-based)
-  → NodeState::Registering (restart from Step 0)
-
-Connection Timeout (30s, io_uring path only):                    [main.rs:782-786]
-  Pre-Established + 30_000_000_000 ns elapsed since start
-  → Process exits cleanly
-
-Handshake Failure:                                               [main.rs:1012-1014]
-  process_handshake_node() returns None
-  → RxAction::HandshakeFailed → NodeState::Disconnected
-  → On next valid RX frame: Disconnected→Registering auto-transition [main.rs:504-506]
-
-Rekey Trigger:                                                   [main.rs:177-180 / 488-491]
-  frame_count ≥ REKEY_FRAME_LIMIT (2³² = 4,294,967,296)
-  OR elapsed > REKEY_TIME_LIMIT_NS (3600s = 1 hour)
-  → Node: NodeState::Registering → full re-handshake (Step 0)
-  → Hub: PeerSlot persists; new handshake overwrites session_key + cipher
-  → Zero downtime: old cipher active until new Finished completes
-```
-
----
-
-## V. Phase 0: Silicon Provisioning & Micro-Architecture Isolation
-
-### Target Flight Hardware: AMD/Xilinx K26 SOM (Hub & Node)
-
-**Silicon Geometry:** The Zynq UltraScale+ MPSoC possesses a **Quad-Core ARM Cortex-A53**.
-
-*   **Core 0:** Reserved for Linux Housekeeping (SMMU, VFS locks, SSH, unpinned hardIRQs).
-*   **Cores 1, 2, 3:** Physically isolated for M13's Net I/O, Datapath, and Crypto threads.
-*   **Memory:** 4GB total DDR4. We lock 512MB (`hugepages=256`) for the zero-copy Arenas.
-
-**Implementation (Yocto EDF / U-Boot):**
-Do not attempt to use `update-grub`. Append the kernel parameters via your Yocto `machine.conf`, Device Tree (`system-user.dtsi`), or dynamically at runtime via `extlinux.conf`.
-
-```bash
-# 1. Modify the U-Boot extlinux configuration on the K26 SOM
-sudo sed -i '/^[[:space:]]*append/ s/$/ isolcpus=1,2,3 rcu_nocbs=1,2,3 nohz_full=1,2,3 irqaffinity=0 hugepagesz=2M hugepages=256/' /boot/extlinux/extlinux.conf
-
-# 2. Sync filesystem and reboot to apply silicon isolation
-sync && sudo reboot
-
-```
-
-> **Verification Post-Reboot:**
-> 1. Verify CPU Isolation: `cat /sys/devices/system/cpu/isolated` → Must output exactly `1-3`.
-> 2. Verify HugePage allocation: `cat /proc/sys/vm/nr_hugepages` → Must output `256`.
-> *If either check fails, the pipeline will fall back to the CFS scheduler and the mission MUST be aborted.*
-> 
-
-### Build Dependencies (Run on K26 or Cross-Compile Host)
-
-```bash
-# Install Rust HFT Toolchain & Kernel 6.12+ Headers
-sudo apt update && sudo apt install -y curl build-essential clang llvm libbpf-dev pkg-config libelf-dev make linux-headers-$(uname -r)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup default stable && rustup update
-
-```
-
----
-
-## VI. Dependencies & Security Posture
-
-M13 relies on an absolute minimum of external crates to reduce the supply chain attack surface.
-
-### Workspace Release Profile (`Cargo.toml`)
-
-```toml
-[profile.release]
-panic = "abort"      # No unwind tables — binary size reduction, panic = instant exit
-lto = true           # Whole-program link-time optimization across all crates
-codegen-units = 1    # Maximum optimization (no parallel codegen splitting)
-opt-level = 3        # Aggressive optimization
-strip = "symbols"    # Strip debug symbols from release binary
-```
-
-### Hub & Node Shared Dependencies
-
-| Crate | Version | Subsystem | Hot Path? | Justification |
-| --- | --- | --- | --- | --- |
-| `libc` | 0.2 | Core I/O | ✅ | `mmap`, `sched_setaffinity`, `poll`, `read`/`write` |
-| `ring` | 0.17 | Crypto | ✅ | AES-256-GCM `LessSafeKey` for AEAD seal/open |
-| `bytemuck` | 1.14 | Parsing | ✅ | Zero-copy header casting (`derive` feature) |
-| `ml-kem` | 0.2 | PQC | ❌ | FIPS 203 ML-KEM-1024 key encapsulation (handshake only) |
-| `ml-dsa` | 0.0.4 | PQC | ❌ | FIPS 204 ML-DSA-87 digital signatures (handshake only) |
-| `sha2` | 0.10 | PQC | ❌ | SHA-512 for HKDF + transcript hashing (handshake only) |
-| `hkdf` | 0.12 | PQC | ❌ | HKDF-SHA-512 session key derivation (handshake only) |
-| `rand` | 0.8 | PQC | ❌ | OsRng CSPRNG via `getrandom(2)` (handshake only) |
-| `bindgen` | 0.69 | Build | ❌ | Build-time kernel header bindings |
-
-### Hub-Specific Dependencies
-
-| Crate | Version | Subsystem | Hot Path? | Justification |
-| --- | --- | --- | --- | --- |
-| `libbpf-sys` | 0.6 | Network | ❌ (Init) | Loads XDP/eBPF redirect program at `run_executive()` init |
-
-### Node-Specific Dependencies
-
-| Crate | Version | Subsystem | Hot Path? | Justification |
-| --- | --- | --- | --- | --- |
-| `io-uring` | 0.7 | Network | ✅ | Kernel 6.12+ `IORING_SETUP_SQPOLL`, `IORING_RECV_MULTISHOT`, PBR |
-
----
-
-## VII. Zero-Waste Determinism (Static Liveness Protocol)
-
-M13 enforces a strict, zero-waste binary footprint. The architecture mandates that any code failing to mathematically prove its liveness in the compiler's Mid-Level Intermediate Representation (MIR) is inherently adversarial and must be automatically incinerated.
-
-Lexical analysis (`grep`/Bash) is explicitly banned due to macro-expansion blindness. M13 achieves proof of liveness via a custom `rustc` driver and strict compiler lints (`#![deny(dead_code)]`, `#![deny(unused_variables)]`) that traverse the intermediate compiler graphs. This guarantees a pristine topological blueprint for all future hardware migrations.
-
-### 1. MIR Call-Graph Reachability
-
-M13 models function execution as a directed graph $G = (V, E)$, where $V$ represents all functions and $E$ represents invocation edges in the MIR. The protocol computes the transitive closure originating strictly from hardware entry points (e.g., `main`, interrupt vectors, eBPF hooks).
-
-Let $R$ be the set of root execution nodes. A function node $v$ is mathematically live if and only if:
-$$v \in Closure(R) \iff \exists \text{ path from } R \text{ to } v$$
-
-Any function $v \notin Closure(R)$ is proven dead by the compiler. The build pipeline automatically aborts, demanding manual developer removal of the phantom execution path.
-
-### 2. HIR Field-Level Memory Validation
-
-Bloated struct definitions waste L1d cache and memory bandwidth. The M13 compiler driver traverses the High-Level Intermediate Representation (HIR) to enforce bidirectional memory liveness.
-
-For every field $f$ within a struct $S$, the compiler must verify two distinct state transitions across the codebase:
-* **Write State:** $\exists$ an assignment to $S.f$
-* **Read State:** $\exists$ a subsequent load from $S.f$
-
-If $S.f$ is written to but never read, or read but statically initialized without modification, the field is classified as a phantom payload and the compilation panics.
-
-### 3. MIR Semantic Liveness (Def-Use Chains)
-
-M13 executes strict Dataflow Analysis on the MIR control-flow graph to eradicate dead stores and discarded error codes. A variable assignment (Definition) is only mathematically valid if it reaches a subsequent consumer (Use) that influences hardware state (e.g., an `io_uring` submission, an `AF_XDP` ring update, or a hardware DMA register write).
-
-The compiler evaluates the `LiveOut` state for every basic block $n$:
-$$LiveOut(n) = \bigcup_{s \in succ(n)} LiveIn(s)$$
-
-If a variable is defined but its state transitions to `StorageDead` before reaching a valid `LiveIn` state of a successor block, the allocation is flagged as a semantic leak.
-
-### 4. Zero-Tolerance Dependency Pruning
-
-The supply chain attack surface is minimized by continuously auditing the AST for phantom external crates. M13 utilizes strict `cargo-udeps` integration at the CI/CD level.
-
-If a crate is declared in `Cargo.toml` but lacks a resolved invocation edge in the lowered AST, the build fails. There are zero waivers for unused dependencies.
-
----
-
-## VIII. Verification & Validation (V&V) Matrix
-
-"Happy Path" testing is structurally prohibited. M13 must mathematically prove its logical correctness, memory safety, and physical resilience against adversarial physics, cryptographic anomalies, and silicon bottlenecks before Tier-1 flight trials.
-
-Execution of this matrix guarantees the state machine is perfectly deterministic. The V&V Matrix strictly separates logical software proofs from physical silicon validation.
-
-### Tier 1: Core Mathematical Integration
-
-Validates the foundational mathematics and deterministic memory boundaries of the architecture in absolute isolation.
-
-* **Vector:** 84 strict deterministic tests executed via `cargo test` (35 Hub unit, 30 integration via `tests/integration.rs`, 19 Node unit).
-* **Criteria:** Verifies VPP pipeline scatter/gather logic, Galois Field matrix inversions, AES-256-GCM AEAD bit-exactness, wire format parity, and Compile-Time Typestate transitions. Zero allocations permitted in the hot path during execution.
-
-### Tier 2: Namespace Bounded Integration (NetNS E2E)
-
-Validates the **logical packet-processing graph (VPP)** and typestate transitions without RF/cloud variability, utilizing strict Linux Network Namespaces bridged via a synthetic `veth` pair.
-
-* **Vector:** Kernel-isolated Linux `netns` (`ns_node`, `ns_hub`).
-* **Criteria:** PQC handshake mathematically converges within **250ms**. Base logical throughput achieves theoretical maximums limited only by DDR4 memory bandwidth. `SIGKILL` on the Node triggers Hub `E_PEER_TIMEOUT` detection within **500ms**, verifying state machine timeout enforcement.
-
-### Tier 3: Cryptographic Fuzzing (`libfuzzer`)
-
-Mathematical proofs of spatial memory safety and algorithmic stability under adversarial mutation.
-
-* **Vector:** `cargo-fuzz` compiling against LLVM libFuzzer.
-* **Criteria:** Millions of mutating, adversarial byte arrays injected into `rx_parse_raw()`, `Assembler::feed()`, and `open_frame()`. The AST must mathematically guarantee a `false` or `Drop` return type without triggering timing side-channels, Out-Of-Memory (OOM) conditions, arithmetic panics, or segmentation faults.
-
-### Tier 4: Micro-Architectural Benchmarking (`criterion`)
-
-Instruction-Per-Cycle (IPC) variance tracking and ALU saturation bounds.
-
-* **Vector:** `cargo bench` isolated to CPU Core 0 via `taskset` and CPU affinity pinning.
-* **Criteria:** `aead_decrypt_vector` and `classify_route` batches must not regress in CPU cycle cost by **> 2%** across any commit. Any latency regression automatically halts the CI/CD pipeline, enforcing strict cycle-budget invariant bounds.
-
-### Tier 5: Kinetic Survival & Chaos Engineering (CSE)
-
-Validates the logical VPP state machines against Contested Spectrum Environment (CSE) realities.
-
-* **Vector:** `tc netem` applied to Tier 2 virtual interfaces, injecting rigorous Gilbert-Elliott burst-loss models.
-* **Criteria:**
-* Inject `loss 30%`. Verify Software RLNC/FEC recovers the stream mathematically without triggering TCP `DUP-ACK` storms at the TUN boundary.
-* Inject `delay 4s`. Verify MBB Epoch continuity and PQC Handshake survival.
-* Inject `delay 6s`. Verify deterministic `HANDSHAKE_TIMEOUT_NS` correctly resets the FSM to `Disconnected`.
-* Inject 100,000 duplicated `seq_id` payloads. Verify `replay_drops` atomic counter increments perfectly via the RFC 6479 bitmask with CPU utilization delta **< 1%**, proving algorithmic DoS immunity.
-
-
-
-### Tier 6: Hardware-In-The-Loop (HITL) Silicon Proof
-
-Validates the **true physical pipeline** (PCIe, DMA, AXI Bus, SMMU) against physical RF degradation and hardware exhaustion.
-
-* **Vector:** Physical K26 SOM connected via physical Gigabit Ethernet/WiFi to an RF channel emulator.
-* **Criteria:** Validates BBRv3 EDT pacing against real hardware queue backpressure. Validates IEEE 1588 hardware timestamping accuracy from the physical Gigabit Ethernet MAC (GEM). Proves zero CPU thermal throttling and zero dropped packets at the physical NIC ring buffers under sustained 50 Mbps Bandwidth-Delay Product (BDP) micro-bursts.
-
----
-
-## IX. Project Documents
-
-| Document | Purpose |
-|----------|---------|
-| [TODO.md](TODO.md) | Technical debt ledger, sprint cards, telemetry matrix, V&V tiers |
-| [OBSERVATIONS.md](OBSERVATIONS.md) | Quantified sprint metrics, cross-sprint comparison tables, measurement formulas |
-| [PROTOCOL.md](PROTOCOL.md) | Engineering workflow: pre-sprint research, execution, debugging, post-sprint documentation |

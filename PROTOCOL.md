@@ -1,7 +1,9 @@
 # M13 Engineering Protocol
 
-> **Purpose**: Codify the exact process for executing sprints. Every sprint follows these
-> four phases in order. Skipping phases or reordering them is prohibited.
+> **Purpose**: 
+> Codify the exact process for executing sprints. 
+> Every sprint follows these four phases in order. 
+> Skipping phases or reordering them is prohibited.
 
 ---
 
@@ -157,128 +159,373 @@ cargo test --workspace 2>&1 | tail -20        # 100% pass rate required
 
 Compiler lints prove syntactic liveness but cannot detect semantic drift — a function can compile cleanly yet be orphaned from the actual runtime pipeline because its caller was refactored, its return value is silently discarded, or its call site was guarded behind a `false` branch. This step opens every source file, reads every function body, and proves the **actual logic** is called, receives correct inputs, and feeds its output into the next pipeline stage.
 
-**6a — Hub Execution Pipeline (README §III.2):**
+**6a — Hub Execution Pipeline (README §3.2, §4 Phase 1):**
 
 Open `hub/src/main.rs` and trace the following call chain. For each arrow (→), open the callee's source file and verify the function body exists, the parameters match what the caller passes, and the return value is consumed:
 
 ```
-main()
-  → run_executive(if_name, single_queue, tunnel)
-    → BpfSteersman::load_and_attach(if_name) — open bpf.rs, verify it returns or panics (no Option)
-    → create_tun("m13tun0") — open datapath.rs, verify TUN fd is returned and used
-    → setup_nat() — verify called immediately after create_tun
-    → SpscRing::new() ×4 — open spsc.rs, verify Producer/Consumer handles are created
-    → thread::Builder::new().spawn(tun_housekeeping_thread) — verify:
-        • tun_housekeeping_thread() exists and its signature matches the closure args
-        • It blocks on OnceLock until UMEM base is published
-        • Its main loop calls: free_slab drain → tun_fd write → tun_fd read → SPSC push
-    → worker_entry(core_id, ...) — verify:
-        • Engine::new_zerocopy() is called — open xdp.rs, verify AF_XDP bind occurs
-        • umem_info.set() publishes UMEM base to TUN HK thread
-        • FixedSlab::new() allocates slab — open runtime.rs, verify slab struct
-        • Pre-stamp loop writes ETH+M13 headers into all slab frames
+main()                                                           [hub/src/main.rs:44]
+  → Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN        [main.rs:48-51]
+  → Panic hook: nuke_cleanup_hub() on unwind                     [main.rs:55-59]
+  → CLI parse:                                                   [main.rs:65-103]
+      if_name, tunnel_mode, single_queue, listen_port, hexdump_mode
+      --monitor → run_monitor() → read /dev/shm telemetry (exits early)
+  → Set M13_LISTEN_PORT env var (default 443)                    [main.rs:109-123]
+  → run_executive(if_name, single_queue, tunnel)                 [main.rs:124]
 
-        VPP Main Loop — verify each graph node is actually invoked per iteration:
-        • engine.recycle_tx() + engine.refill_rx() — open xdp.rs, verify both exist
-        • execute_tx_graph() → tun_read_batch() — open datapath.rs, verify:
-            ◦ free_to_dp_cons.pop_batch() feeds slab.free()
-            ◦ free_to_tun_prod pushes provisioned slab IDs
-            ◦ rx_tun_cons.pop_batch() injects pre-built TUN frames
-        • engine.poll_rx() → PacketVector — verify poll_rx returns batch
-        • scatter() classifies packets — open network/mod.rs, verify scatter logic
-        • rx_parse_raw() — open datapath.rs, verify:
-            ◦ Extracts src_ip/src_port from IP/UDP header offsets
-            ◦ Calls peers.lookup_or_insert() — open protocol.rs, verify PeerTable method
-            ◦ Routes by crypto_ver: 0x00 → cleartext, 0x01 → decrypt
-        • aead_decrypt_vector() — open aead.rs, verify batch decrypt exists
-        • classify_route() — verify FLAG dispatch: CONTROL→Consumed, FRAGMENT→Handshake, TUNNEL→TunWrite
-        • tun_write_vector() — verify SPSC push to TUN HK or VFS fallback
-        • handle_handshake_packet() — verify:
-            ◦ FragHeader parsed (msg_id, index, total, offset, len)
-            ◦ Assembler::feed() called — verify closure-based API matches current signature
-            ◦ On reassembly complete: process_handshake_message() dispatches by msg_type
-        • seal_frame() — open aead.rs, verify nonce construction: seq_id(8)||direction(1)||zeros(3)
-        • build_raw_udp_frame() / build_fragmented_raw_udp() — verify frame construction
-        • scheduler.enqueue_critical() — open protocol.rs, verify enqueue method exists
-        • Telemetry 1/sec print — verify format string matches documented counters
+run_executive()                                                  [hub/src/main.rs:128]
+  → Pre-flight cleanup:                                          [main.rs:141-185]
+      Kill stale m13-hub: pgrep + SIGKILL (exclude self)
+      Detach stale XDP: ip link set <if> xdp off / xdpgeneric off
+      ethtool -L <if> combined 1 — collapse NIC to single queue
+        (AF_XDP binds queue 0; RSS would distribute packets away)
+      Hugepage allocation: ceil(UMEM_SIZE / 2MB) → /proc/sys/vm/nr_hugepages
+  → calibrate_tsc() — open runtime.rs, verify TSC calibration    [hub/engine/runtime.rs]
+  → lock_pmu() + fence_interrupts()                              [hub/engine/runtime.rs]
+      perf_event_open on every core (prevent frequency scaling)
+      IRQ affinity: move all IRQs off isolated cores
+  → discover_isolated_cores()                                    [hub/engine/runtime.rs]
+      Parse /sys/devices/system/cpu/isolated or M13_MOCK_CMDLINE
+  → BpfSteersman::load_and_attach(if_name) — open bpf.rs:       [hub/network/bpf.rs]
+      Read BPF_OBJECT_PATH (set by build.rs)
+      bpf_object__open_file() → bpf_object__load()
+      XDP program m13_steersman:                                 [hub/build.rs:44-77]
+        Path 1: EtherType 0x88B5 → bpf_redirect_map(xsks_map)   [raw L2 M13]
+        Path 2: IPv4 UDP dst port 443 → bpf_redirect_map         [UDP-encaps M13]
+        Default: XDP_PASS (SSH, ARP, etc. → kernel stack)
+      bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE)
+        Fallback: XDP_FLAGS_SKB_MODE if driver mode fails
+      Returns xsks_map fd for AF_XDP socket registration
+  → create_tun("m13tun0") — open datapath.rs:                   [hub/network/datapath.rs]
+      ioctl(TUNSETIFF, IFF_TUN | IFF_NO_PI) → TUN fd
+  → setup_nat() — verify called immediately after create_tun:   [hub/network/datapath.rs]
+      ip link set m13tun0 up
+      ip addr add 10.13.0.1/24 dev m13tun0
+      sysctl net.ipv4.ip_forward = 1
+      iptables -t nat -A POSTROUTING -s 10.13.0.0/24 -j MASQUERADE
+      iptables -A FORWARD -i m13tun0 -j ACCEPT
+      iptables -A FORWARD -o m13tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+      sysctl rmem_max/wmem_max/netdev_max_backlog/rmem_default/wmem_default
+  → SpscRing::new() ×4 — open spsc.rs, verify:                  [hub/engine/spsc.rs]
+      tx_tun:      Producer<PacketDesc> → Consumer<PacketDesc>    (datapath → TUN HK)
+      rx_tun:      Producer<PacketDesc> → Consumer<PacketDesc>    (TUN HK → datapath)
+      free_to_tun: Producer<u32> → Consumer<u32>                  (datapath → TUN HK slab IDs)
+      free_to_dp:  Producer<u32> → Consumer<u32>                  (TUN HK → datapath slab IDs)
+      All rings: lock-free, cache-aligned, depth 2048, power-of-two
+  → OnceLock<(usize, u32)> for UMEM base sharing                [main.rs:232-233]
+      Worker 0 publishes (umem_base_ptr, frame_size) after Engine::new()
+      TUN HK thread blocks on .get() until published
+  → thread::Builder::new().spawn(tun_housekeeping_thread):      [main.rs:236-254]
+      Pinned to last isolated core
+      tun_housekeeping_thread():                                 [main.rs:757-940]
+        Blocks on OnceLock until UMEM base published by Worker 0
+        DPDK-style local cache: [u32; 4096] pending_return
+        Main loop:
+          Phase 0: Drain pending_return → free_slab_tx.push_batch()
+          Phase 1 (TX to kernel): Pop PacketDesc from rx_from_dp →
+            write(tun_fd, payload) → return slab ID to free_slab_tx
+          Phase 2 (RX from kernel): poll(POLLIN, 1ms) →
+            alloc from free_slab_rx → read(tun_fd) →
+            build ETH+M13 header in UMEM → push PacketDesc to tx_to_dp
+  → Worker 0 handle distribution via .take()                     [main.rs:262-278]
+      Only worker 0 gets SPSC Producer/Consumer handles
+  → worker_entry(core_id, ...) — verify:                         [main.rs:942-1542]
+      pin_to_core(core_id) + verify_affinity()                   [hub/engine/runtime.rs]
+      Telemetry::map_worker() → /dev/shm mmap                   [hub/engine/runtime.rs]
+      Engine::new_zerocopy(if_name, queue_id, bpf_map_fd):      [hub/network/xdp.rs]
+        HugeTLB mmap for UMEM (2MB hugepages)
+        xsk_socket__create_shared() → AF_XDP socket
+        bpf_map_update_elem(xsks_map, queue_id, xsk_fd)
+        Fill Ring, Completion Ring, RX Ring, TX Ring initialized
+      Worker 0: umem_info.set() → unblock TUN HK thread          [main.rs:962-966]
+      FixedSlab::new(8192)                                        [hub/engine/runtime.rs]
+        Bitmap-based O(1) allocator for UMEM frame indices
+      Scheduler::new() — dual-queue (critical/bulk) + EDT        [hub/engine/protocol.rs]
+      PeerTable::new(epoch_ns) — 256 slots + assemblers          [hub/engine/protocol.rs]
+        Each slot: PeerSlot(64B align), Scheduler, ReceiverState, JitterBuffer,
+        Assembler(8 HugeTLB AssemblySlots), cipher, hs_sidecar
+      Detect hub_ip: get_interface_ip() + resolve_gateway_mac()  [hub/network/datapath.rs]
+      Pre-stamp ALL 8192 slab frames with ETH+M13 headers:       [main.rs:1007-1022]
+        dst=[0xFF;6], src=iface_mac, ethertype=0x88B5(BE),
+        magic=0xD1, version=0x01, seq=0, flags=0
+      measure_epsilon_proc() → processing jitter floor            [hub/engine/protocol.rs]
+      JitterBuffer::new()                                        [hub/engine/protocol.rs]
+        RFC 3550 EWMA Q60.4 fixed-point jitter estimator
+      PQC Arena Allocation:                                      [main.rs:1052-1064]
+        payload_arena: [[0u8; 9216]; MAX_PEERS] → leaked *mut
+          (datapath writes reassembled handshake, Core 0 reads)
+        hs_state_arena: [FlatHubHandshakeState; MAX_PEERS] → leaked *mut
+          (Core 0 local: stores inter-message handshake state)
+      make_pqc_spsc() ×2:                                        [hub/cryptography/async_pqc.rs]
+        pqc_req: Producer<PqcReq> → Consumer<PqcReq>              (datapath → Core 0)
+        pqc_resp: Producer<PqcResp> → Consumer<PqcResp>           (Core 0 → datapath)
+      thread::Builder::new().spawn(pqc_worker_thread):           [main.rs:1070-1081]
+        Arena pointers passed as usize (Send-safe), reconstructed inside closure
+        pqc_worker_thread() receives: core_id, pqc_req_cons, pqc_resp_prod, arenas, MAX_PEERS
+        Main loop: pop PqcReq batch → dispatch by msg_type:
+          msg_type=0x01: process_client_hello_hub() → store FlatHubHandshakeState → push PqcResp
+          msg_type=0x03: process_finished_hub() → derive session_key → push PqcResp
+      EdtPacer::new(cal, 100_000_000)                             [hub/network/uso_pacer.rs]
+        Zero-spin EDT pacer, 100 Mbps default MANET link rate
+
+      VPP Main Loop — verify each graph node is actually invoked per iteration:
+        [SHUTDOWN check]:                                        [main.rs:1097-1131]
+          3× FIN burst to all Established peers via
+          send_fin_burst_udp() or send_fin_burst_l2()
+          Then RX-only until FIN-ACK or deadline
+        engine.recycle_tx() + engine.refill_rx()                 [hub/network/xdp.rs]
+        execute_tx_graph() (worker 0 only):                      [main.rs:651-755]
+          free_to_dp_cons.pop_batch() → slab.free()
+          Demand-driven slab provision: free_to_tun_prod.push_batch()
+          Pop TUN frames: rx_tun_cons.pop_batch() →
+            lookup_by_tunnel_ip() → seal_frame() → build_fragmented_raw_udp_rlnc()
+            EDT pacer.pace() → enqueue_bulk_edt() with release_ns timestamp
+        Telemetry: 1/sec report                                  [main.rs:1180-1196]
+        STAGE 0: Adaptive batch drain                            [main.rs:1198-1207]
+          engine.poll_rx_batch() → xdp_desc[] (up to GRAPH_BATCH=256)
+          Coalesce loop: gather until 256 or DEADLINE_NS (50µs)
+        STAGE 0.5: Jitter buffer drain                           [main.rs:1209-1222]
+          jbuf.drain(now_ns, scheduler) → release buffered frames
+        execute_graph(rx_descs, GraphCtx):                       [main.rs:340-379]
+          execute_subvector() per 64-packet chunk:               [main.rs:381-552]
+            rx_parse_raw() → PacketVector                        [hub/network/datapath.rs]
+              Validates magic=0xD1, version=0x01, crypto_ver routing:
+              crypto_ver=0x00 → cleartext_out (handshake/control)
+              crypto_ver=0x01 → decrypt_out (AEAD encrypted)
+              Extracts src_ip/src_port from IP/UDP header offsets
+              Calls peers.lookup_or_insert() — verify PeerTable method
+              Learns hub_ip/gateway_mac from first inbound
+            aead_decrypt_vector()                                [hub/network/datapath.rs]
+              Per-packet: peer lookup → open_frame() with peer cipher
+              Nonce read from frame[sig+20..sig+32] (12 bytes)
+              Reflection guard: nonce_bytes[8] ≠ DIR_HUB_TO_NODE (0x00)
+            classify_route() → Disposition                       [hub/network/datapath.rs]
+              Priority routing (first match wins):
+                FLAG_FIN       → Consumed (FIN deferred to post-executor)
+                FLAG_FEEDBACK  → Feedback
+                FLAG_FRAGMENT  → Handshake
+                FLAG_HANDSHAKE → Handshake
+                FLAG_CONTROL   → Consumed (echo, keepalive)
+                FLAG_TUNNEL    → TunWrite
+                FLAG_FEC       → RlncDecode
+                default        → TxEnqueue (data forward)
+            scatter()                                            [hub/network/mod.rs]
+              4-wide prefetch scatter into per-NextNode output vectors
+            tun_write_vector()                                   [hub/network/datapath.rs]
+              Push PacketDesc to SPSC tx_tun ring → TUN HK thread
+              (worker 0 only; other workers: direct write(tun_fd))
+            CycleStats accumulation → Telemetry SHM
+        process_fragment() — handshake fragments:                [main.rs:554-649]
+          typestate::validate_frag_index(index, total)           [hub/engine/typestate.rs]
+            Branchless: (index >= total) as usize → panic-free clamp
+          typestate::validate_frag_data_bounds(offset, len)     [hub/engine/typestate.rs]
+            Branchless OOB check preventing adversarial slice
+          peers.assemblers[pidx].feed(msg_id, index, total, offset, data)
+          On reassembly complete:
+            process_handshake_message() dispatches by reassembled[0]:
+              HS_CLIENT_HELLO (0x01): copy 4194B to payload_arena[pidx] → push PqcReq
+              HS_FINISHED (0x03): copy 4628B to payload_arena[pidx] → push PqcReq
+              Zero inline lattice math — all PQC crypto offloaded to Core 0
+        FIN processing (deferred from executor):                 [main.rs:1309-1338]
+          FIN received → send_fin_burst_*() FIN-ACK → evict peer
+          FIN-ACK received → clear deadline, close complete
+        Registration echo processing:                            [main.rs:1340-1417]
+          For each non-Established peer:
+          100ms throttle → build Echo (FLAG_CONTROL) →
+          build_raw_udp_frame() or raw L2 → enqueue_critical()
+          Slab leak prevention: free on enqueue failure
+        STAGE 3: Feedback generation                             [main.rs:1422, 310-336]
+          stage_feedback_gen() if needs_feedback(pkt_since_feedback ≥ 32)
+          produce_feedback_frame() → 102B → enqueue_critical()
+        V4: PQC Response Drain:                                  [main.rs:1424-1516]
+          Pop PqcResp batch from pqc_resp_cons:
+            msg_type=0x02 (ServerHello):
+              Frame 8788B payload with local hub_ip/gateway_mac
+              build_fragmented_raw_udp_rlnc() or build_fragmented_l2_rlnc()
+              k = ceil(8788/1402) = 7 systematic, m=0 (FLAG_HANDSHAKE → no RLNC)
+              → enqueue_critical() (handshake frames are priority)
+            msg_type=0x03 (SessionEstablished):
+              Install AES-256-GCM LessSafeKey in peers.ciphers[pidx]
+              PeerLifecycle::Established, alloc_tunnel_ip() → 10.13.0.X
+              Clear hs_sidecar
+        seal_frame() — verify in hub/cryptography/aead.rs:
+          Nonce construction: seq_id(8) || direction(1) || zeros(3) = 12 bytes
+          Nonce stored at frame[sig+20..sig+32]
+          Tag (16 bytes) stored at frame[sig+4..sig+20]
+          AAD: frame[sig..sig+4] (magic, version, crypto_ver, reserved)
+          Encrypted region: frame[sig+32..frame_end] (seq_id, flags, payload_len, padding, payload)
+        STAGE 6: Schedule TX                                     [main.rs:1518-1523]
+          scheduler.schedule(tx_path, now_ns):
+          EDT-gated dequeue: critical-first, then bulk
+          Won't release frames before release_ns timestamp
+          tx_path.stage_tx_addr() → tx_path.commit_tx() → kick_tx()
+        Periodic GC (every 10,000 cycles):                       [main.rs:1524-1529]
+          peers.gc() + assembler.gc() per peer (5-second stale expiry)
 ```
 
-**6b — Node Execution Pipeline (README §III.4):**
+**6b — Node Execution Pipeline (README §3.4, §4 Phase 2):**
 
 Open `node/src/main.rs` and trace:
 
 ```
-main()
-  → create_tun("m13tun0") — open datapath.rs, verify TUN fd returned
-  → run_uring_worker(hub_addr, echo, hexdump, tun_file)
-    → calibrate_tsc() — open runtime.rs, verify TSC calibration
-    → tune_system_buffers() — verify sysctl writes (rmem_max, wmem_max)
-    → UdpSocket::bind → connect(hub_addr)
-    → UringReactor::new(raw_fd, cpu) — open uring_reactor.rs, verify:
-        ◦ HugeTLB mmap allocates 2MB-aligned arena
-        ◦ IoUring::builder().setup_sqpoll() configures SQPOLL
-        ◦ IORING_REGISTER_PBUF_RING syscall registers PBR
-        ◦ arm_multishot_recv() arms the lifetime SQE
-    → build_m13_frame(FLAG_CONTROL) — open protocol.rs, verify frame builder
-    → sock.send(&reg) — registration frame sent
+main()                                                           [node/src/main.rs:37]
+  → Signal handlers: SIGTERM/SIGINT → AtomicBool SHUTDOWN        [main.rs:42-44]
+  → Panic hook: nuke_cleanup_node()                               [main.rs:48-52]
+      Calls: nuke_cleanup("m13tun0", hub_ip)                     [node/network/datapath.rs]
+      Idempotent: ip route del, ip link del, iptables flush
+  → CLI parse:                                                    [main.rs:54-74]
+      echo, hexdump, tunnel, hub_ip (required)
+  → create_tun("m13tun0") — open datapath.rs:                   [node/network/datapath.rs]
+      ioctl(TUNSETIFF, IFF_TUN | IFF_NO_PI) → File
+  → Store hub IP in HUB_IP_GLOBAL Mutex                          [main.rs:78-79]
+      (for panic hook route teardown)
+  → run_uring_worker(hub_addr, echo, hexdump, tun_file)          [main.rs:81]
 
-    CQE Three-Pass Main Loop — verify each pass is actually coded:
+run_uring_worker()                                                [node/src/main.rs:723]
+  → calibrate_tsc() — open runtime.rs, verify TSC calibration    [node/engine/runtime.rs]
+  → tune_system_buffers() — verify sysctl writes:                [main.rs:274-330]
+      net.core.rmem_max, wmem_max, netdev_max_backlog,
+      rmem_default, wmem_default (all to 4MB+)
+  → UdpSocket::bind("0.0.0.0:0") → connect(hub_addr)
+      O_NONBLOCK, SO_RCVBUFFORCE=8MB, SO_SNDBUFFORCE=8MB
+  → UringReactor::new(raw_fd, cpu=0) — open uring_reactor.rs:   [node/network/uring_reactor.rs]
+      HugeTLB mmap: 2MB-aligned arena (PBR metadata + data frames)
+      IoUring::builder()
+        .setup_sqpoll(2000ms)          SQPOLL kernel thread, 2s idle timeout
+        .setup_single_issuer()         Single-thread SQ ownership
+      SYS_io_uring_register IORING_REGISTER_PBUF_RING
+        Register Provided Buffer Ring with kernel
+      Pre-register all BIDs in PBR
+      arm_multishot_recv()
+        Single SQE IORING_OP_RECV with IOSQE_BUFFER_SELECT + MULTISHOT
+        Survives for lifetime of socket (no per-packet SQE submission)
+  → Arm TUN reads: BIDs in [UDP_RING_ENTRIES .. TOTAL_BIDS)
+  → Assembler::init(alloc_asm_arena()) — open protocol.rs:      [node/engine/protocol.rs]
+      8 AssemblySlots × 9280B per slot (HugeTLB arena)
+  → Build M13 header template:                                   [node/engine/protocol.rs]
+      detect_mac(None) → LAA random MAC
+      src_mac, hub_mac=[0xFF;6], magic=0xD1, version=0x01
+  → build_m13_frame(src_mac, hub_mac, seq=0, flags=0x00)         [node/engine/protocol.rs:61]
+      → 62-byte registration frame: ETH(14) + M13(48), all zeroes payload
+  → sock.send(&frame) — registration frame sent
+  → NodeState::Registering                                        [node/engine/runtime.rs]
+
+  CQE Three-Pass Main Loop — verify each pass is actually coded:
+
+    SHUTDOWN check + 30s connection timeout
+
     Pass 0 (CQE Drain + Classify):
-        • reactor.ring.completion().sync() — verify CQE drain
-        • TAG_UDP_RECV_MULTISHOT → collects recv_bids/recv_lens
-        • TAG_TUN_READ → build_m13_frame → seal_frame → stage_udp_send
-        • TAG_TUN_WRITE → recycles BID to PBR
-        • TAG_UDP_SEND_TUN/ECHO → arm_tun_read(bid)
+      reactor.ring.completion().sync() — verify CQE drain
+      Drain up to 128 CQEs into cqe_batch[]
+      For each CQE, classify by tag:
+        TAG_UDP_RECV_MULTISHOT → collect into recv_bids[]/recv_lens[]
+          Track multishot termination (IORING_CQE_F_MORE == 0 → rearm)
+        TAG_TUN_READ → build M13 header in-place → seal_frame → stage_udp_send
+        TAG_TUN_WRITE → recycle BID to PBR (add_buffer_to_pbr + commit_pbr)
+        TAG_UDP_SEND_ECHO/TUN → arm_tun_read(bid) to recycle BID
 
     Pass 1 (Vectorized AEAD Batch Decrypt):
-        • Guard: Established AND recv_count > 0
-        • Scans for crypto_flag == 0x01 → collects enc_ptrs
-        • decrypt_batch_ptrs() — open aead.rs, verify 4-wide AES-NI pipeline
-        • Stamps PRE_DECRYPTED_MARKER (0x02) on success
-        • Rekey check: frame_count >= limit || time > limit
+      Guard: Established AND recv_count > 0
+      Scan recv frames for crypto_flag == 0x01 → collect enc_ptrs[]
+      decrypt_batch_ptrs() — open aead.rs, verify:               [node/cryptography/aead.rs]
+        4-at-a-time prefetch → saturate AES-NI/ARMv8-CE pipeline
+        decrypt_one() per frame:
+          Read nonce from frame[sig+20..sig+32] (12 bytes)
+          Reflection guard: nonce_bytes[8] == our_dir → reject
+          Read tag from frame[sig+4..sig+20] (16 bytes)
+          AAD: frame[sig..sig+4] (4 bytes)
+          open_in_place_separate_tag() → verify+decrypt
+        Stamps PRE_DECRYPTED_MARKER (0x02) at frame[ETH_HDR_SIZE + 2] on success
+      Rekey check: frame_count >= REKEY_FRAME_LIMIT (2³²)
+        OR elapsed >= REKEY_TIME_LIMIT_NS (1 hour)
 
     Pass 2 (Per-Frame RxAction Dispatch):
-        • process_rx_frame() returns RxAction — verify enum variants:
-            ◦ NeedHandshakeInit → initiate_handshake() — open handshake.rs, verify:
-                · ML-KEM-1024 keygen (dk, ek)
-                · ML-DSA-87 keygen (sk, pk)
-                · OsRng nonce (32 bytes)
-                · send_fragmented_udp() called with ClientHello payload
-                · Returns NodeState::Handshaking
-            ◦ TunWrite → stage_tun_write(tun_fd, ptr, len, bid)
-            ◦ Echo → build_echo_frame → seal_frame → sock.send
-            ◦ HandshakeComplete → verify:
-                · process_handshake_node() — open handshake.rs, verify:
-                    - ML-KEM decapsulate(ct) → shared secret
-                    - SHA-512(CH || ct) transcript → pk_hub.verify()
-                    - HKDF-SHA-512(nonce, ss) → session_key
-                    - SHA-512(CH || SH) → sign → Finished payload
-                · LessSafeKey::new(AES_256_GCM, &key) installs cipher
-                · setup_tunnel_routes() — open datapath.rs, verify ip rule/route commands
-            ◦ HandshakeFailed → NodeState::Disconnected
-            ◦ RekeyNeeded → NodeState::Registering
-        • BID recycled to PBR (unless deferred)
-    • Keepalive: 100ms, pre-Established only — verify guard + build_m13_frame(FLAG_CONTROL)
-    • Telemetry 1/sec — verify format string matches documented counters
+      process_rx_frame() returns RxAction — verify enum variants:
+        NeedHandshakeInit → initiate_handshake():                [node/cryptography/handshake.rs]
+          OsRng → client_nonce (32 bytes)
+          ML-KEM-1024 KeyGen → (dk_node, ek_node)                [ml-kem crate]
+            ek_node = 1568 bytes (encapsulation key)
+            dk_node = decapsulation key (stored in NodeHandshakeState)
+          ML-DSA-87 KeyGen → (sk_node, pk_node)                  [ml-dsa crate]
+            pk_node = 2592 bytes (verification key)
+            sk_node = signing key (stored in NodeHandshakeState)
+          Build ClientHello payload (4194B):
+            [0] = HS_CLIENT_HELLO (0x01)
+            [1] = version (0x01)
+            [2..34] = client_nonce
+            [34..1602] = ek_node (ML-KEM-1024 encapsulation key)
+            [1602..4194] = pk_node (ML-DSA-87 verification key)
+          send_fragmented_udp(payload, flags=FLAG_CONTROL|FLAG_HANDSHAKE)
+            k = ceil(4194/1402) = 3 systematic fragments
+            FLAG_HANDSHAKE → m=0 (no RLNC parity)
+            Each fragment: ETH(14) + M13(48) + FragHdr(8) + chunk(≤1402)
+          Returns NodeState::Handshaking
+        TunWrite → stage_tun_write(tun_fd, ptr, len, bid)
+          BID recycled to PBR after kernel consumes TUN write CQE
+        Echo → build_echo_frame → seal_frame → sock.send
+        HandshakeComplete → verify:                              [node/cryptography/handshake.rs]
+          process_server_hello_node():
+            Parse: ct(1568B), pk_hub(2592B), sig_hub(4627B)
+            Transcript hash: SHA-512(client_nonce || ct || pk_hub)
+            ML-DSA-87 verify_with_context(pk_hub, transcript, sig_hub)
+              → Verify hub identity (prevents MITM)
+            ML-KEM-1024 Decapsulate(dk_node, ct) → shared_secret
+            HKDF-SHA-512(salt=client_nonce, IKM=shared_secret,
+              info="M13-PQC-SESSION-KEY-v1", L=32) → session_key
+            Return NodeHandshakeResult{session_key, pk_hub, transcript}
+          LessSafeKey::new(AES_256_GCM, &session_key) installs cipher
+          Build Finished message (4628B):
+            [0] = HS_FINISHED (0x03)
+            [1..4628] = ML-DSA-87 sign_deterministic(sk_node, transcript)
+          send_fragmented_udp_rlnc(Finished, FLAG_CONTROL|FLAG_HANDSHAKE)
+            k = ceil(4628/1402) = 4, m=0 (FLAG_HANDSHAKE)
+          NodeState::Established
+          setup_tunnel_routes(hub_ip):                           [node/network/datapath.rs]
+            ip addr add 10.13.0.2/24 dev m13tun0
+            ip link set m13tun0 up
+            Detect default gateway via ip route show default
+            ip route add <hub_ip>/32 via <gateway>
+            ip route add 0.0.0.0/1 dev m13tun0 (split-default)
+            ip route add 128.0.0.0/1 dev m13tun0
+            Disable IPv6: net.ipv6.conf.all.disable_ipv6=1
+            iptables -t nat -A POSTROUTING -o m13tun0 -j MASQUERADE
+            MSS clamping: iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN
+              -j TCPMSS --clamp-mss-to-pmtu
+            TCP BDP tuning: sysctl net.ipv4.tcp_wmem/rmem max=16MB
+            tc qdisc replace dev m13tun0 root fq
+        HandshakeFailed → NodeState::Disconnected
+        RekeyNeeded → NodeState::Registering → restart from registration
+      BID recycled to PBR (unless deferred by TunWrite)
+    Re-arm multishot recv if terminated (CQE_F_MORE == 0)
+    Handshake micro-timeout: 250ms retransmit (HANDSHAKE_RETX_INTERVAL_NS)
+      via send_fragmented_udp_rlnc()
+    Keepalive: 100ms interval, pre-Established only
+      verify guard + build_m13_frame(FLAG_CONTROL)
+    Assembler GC: every 5 telemetry ticks (5-second stale expiry)
+    Telemetry 1/sec:
+      RX:{} TX:{} TUN_R:{} TUN_W:{} AEAD_OK:{} FAIL:{} State:{} Up:{}s
+    reactor.submit() + submit_and_wait(0)
 ```
 
-**6c — Cross-Component Data Flow Proof (README §IV):**
+**6c — Cross-Component Data Flow Proof (README §4 Sequence Diagram + Phase 1/2):**
 
-For each of the 7 lifecycle steps, open **both** the sender-side and receiver-side source files simultaneously and prove the data physically crosses:
+For each of the 8 lifecycle steps, open **both** the sender-side and receiver-side source files simultaneously and prove the data physically crosses:
 
 | Step | Sender Function | Wire Data | Receiver Function | Proof Required |
 |------|----------------|-----------|-------------------|----------------|
-| 0 | Node: `build_m13_frame(FLAG_CONTROL)` → `sock.send()` | 62B cleartext | Hub: `rx_parse_raw()` → `lookup_or_insert()` | Verify Hub's M13 offset (56 bytes into UDP) matches Node's frame layout. Verify `FLAG_CONTROL` → `Consumed` (no echo). |
-| 1 | Node: `initiate_handshake()` → `send_fragmented_udp()` | 4194B / 3 frags | Hub: `Assembler::feed()` ×3 → `process_client_hello_hub()` | Verify fragment MTU (1402) produces exactly ⌈4194/1402⌉ = 3 fragments. Verify `Assembler` closure receives correct offsets. Verify `process_client_hello_hub` extracts ek at `[34..1602]` and pk at `[1602..4194]` — byte ranges must match `initiate_handshake` layout. |
-| 2 | Hub: `process_client_hello_hub()` → `build_fragmented_raw_udp()` | 8788B / 7 frags | Node: `Assembler::feed()` ×7 → `process_handshake_node()` | Verify ServerHello layout: type(1) + ct(1568) + pk(2592) + sig(4627) = 8788. Verify Node extracts ct at `[1..1569]`, pk at `[1569..4161]`, sig at `[4161..8788]` — must match Hub's construction. |
-| 3 | Node: `process_handshake_node()` → `send_fragmented_udp()` | 4628B / 4 frags | Hub: `Assembler::feed()` ×4 → `process_finished_hub()` | Verify Finished layout: type(1) + sig(4627) = 4628. Verify Hub extracts sig at `[1..4628]`. Verify both sides compute identical transcripts: `SHA-512(CH \|\| SH)`. |
-| 4 | Both: `HKDF-SHA-512(nonce, ss, "M13-PQC-SESSION-KEY-v1")` | — | Both | Verify HKDF parameters (salt, IKM, info string, output length=32) are **byte-identical** in `hub/src/cryptography/handshake.rs` and `node/src/cryptography/handshake.rs`. Any mismatch = silent AEAD failure. |
-| 5 | Node: `seal_frame(cipher, seq, DIR_NODE_TO_HUB)` | AEAD tunnel | Hub: `open_frame(cipher, DIR_HUB_TO_NODE)` | Verify nonce construction is mirror-symmetric: Node seals with `direction=0x01`, Hub opens expecting `direction != 0x00` (reflection guard). Verify AAD bytes (4) and tag position (offset+4..+20) match on both sides. |
-| 6 | Hub: `seal_frame(cipher, seq, DIR_HUB_TO_NODE)` | AEAD tunnel | Node: `open_frame(cipher, DIR_NODE_TO_HUB)` | Same mirror verification as Step 5, reversed direction. |
+| 1. Registration | Node: `build_m13_frame(seq=0, flags=0x00)` → `sock.send()` | 62B cleartext: ETH(14) + M13(48) | Hub: `rx_parse_raw()` → `lookup_or_insert()` → PeerLifecycle::Registered | Verify Hub's M13 offset is `RAW_HDR_LEN` (42 = ETH 14 + IP 20 + UDP 8). Verify `flags=0x00` → no flag match → TxEnqueue but no session → registration only. |
+| 2. Echo | Hub: `build_raw_udp_frame(FLAG_CONTROL)` → `enqueue_critical()` | 62B: ETH(14) + M13(48), flags=0x80 | Node: `process_rx_frame()` → `RxAction::NeedHandshakeInit` | Verify 100ms throttle guard. Verify Node checks `FLAG_CONTROL` AND `state == Registering`. |
+| 3. ClientHello | Node: `initiate_handshake()` → `send_fragmented_udp()` | 4194B / 3 frags (⌈4194/1402⌉=3) | Hub: `Assembler::feed()` ×3 → `process_handshake_message()` → PQC SPSC → `process_client_hello_hub()` | Verify ClientHello layout: type(1) + version(1) + nonce(32) + ek(1568) + pk(2592) = 4194. Verify Hub extracts ek at `[34..1602]` and pk at `[1602..4194]`. Verify FLAG_HANDSHAKE → m=0 (no RLNC parity). |
+| 4. ServerHello | Hub: Core 0 `process_client_hello_hub()` → PqcResp → `build_fragmented_raw_udp_rlnc()` | 8788B / 7 frags (⌈8788/1402⌉=7), m=0 | Node: `Assembler::feed()` ×7 → `process_server_hello_node()` | Verify ServerHello layout: type(1) + ct(1568) + pk_hub(2592) + sig_hub(4627) = 8788. Verify Node extracts ct at `[1..1569]`, pk at `[1569..4161]`, sig at `[4161..8788]`. Verify FLAG_HANDSHAKE → m=0 (no RLNC parity for handshakes). |
+| 5. Finished | Node: `process_server_hello_node()` → `send_fragmented_udp_rlnc()` | 4628B / 4 frags (⌈4628/1402⌉=4), m=0 | Hub: `Assembler::feed()` ×4 → PQC SPSC → `process_finished_hub()` | Verify Finished layout: type(1) + sig_node(4627) = 4628. Verify Hub extracts sig at `[1..4628]`. Verify both sides compute identical transcript: `SHA-512(client_nonce \|\| ct \|\| pk_hub)`. |
+| 6. HKDF Key | Both: `Hkdf::<Sha512>::new(Some(nonce), &shared_secret)` → `.expand(PQC_INFO, &mut key)` | — (internal) | Both | Verify HKDF parameters are **byte-identical** in `hub/cryptography/handshake.rs:174` and `node/cryptography/handshake.rs:174`: salt=session_nonce, IKM=shared_secret, info=`b"M13-PQC-SESSION-KEY-v1"` (constant `PQC_INFO` at hub:21, node:19), L=32. Any mismatch = silent AEAD failure at runtime. |
+| 7. Upstream AEAD | Node: `seal_frame(cipher, seq, DIR_NODE_TO_HUB=0x01)` | AEAD tunnel frame | Hub: `open_frame(cipher, DIR_HUB_TO_NODE=0x00, offset=42)` | Verify nonce: `seq(8) \|\| dir(1) \|\| zeros(3)` at `frame[sig+20..sig+32]`. Node seals with `direction=0x01`, Hub opens with `our_dir=0x00` — reflection guard: `nonce_bytes[8]=0x01 ≠ 0x00` → passes. Verify AAD (4 bytes) and tag position (`sig+4..sig+20`) match both sides. Verify Hub `offset=42` (RAW_HDR_LEN for UDP peers). |
+| 8. Downstream AEAD | Hub: `seal_frame(cipher, seq, DIR_HUB_TO_NODE=0x00, offset)` | AEAD tunnel frame | Node: `decrypt_batch_ptrs()` → `decrypt_one(cipher, DIR_NODE_TO_HUB=0x01)` | Mirror of Step 7. Hub seals with `direction=0x00`, Node opens with `our_dir=0x01` — reflection guard: `nonce_bytes[8]=0x00 ≠ 0x01` → passes. Verify Node uses `ETH_HDR_SIZE=14` as implicit offset. Verify `PRE_DECRYPTED_MARKER (0x02)` stamped at `frame[ETH_HDR_SIZE+2]` on success. |
 
 > **Rule**: If any function body is missing, any call-site passes wrong arguments, any byte-range
 > extraction mismatches the sender's layout, or any HKDF/nonce parameter differs between Hub
 > and Node — the sprint MUST halt. The wiring defect must be fixed before deployment.
+
 
 
 ### 2.3 Report & Deploy
@@ -355,7 +602,7 @@ T0=$(date +%s); cargo run --release -- --hub <HUB_IP>:443 2>&1 | tee /tmp/m13_no
 Hypothesis → Prediction → Test → Conclusion
 
 Example:
-  Hypothesis: "AEAD failures are caused by nonce reuse after rekey"
+  Hypothesis: "AEAD failures are caused by nonce reuse after rekey". Check Known Failure Vectors section of @OBSERVATIONS.md.
   Prediction: "If true, AEAD_FAIL should spike at exactly REKEY_FRAME_LIMIT"
   Test:       "Log seq_id at AEAD_FAIL events. Check if seq_id = 2^32"
   Conclusion: "Confirmed / Refuted. If refuted, next hypothesis."

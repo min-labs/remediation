@@ -3,3 +3,4 @@
 
 pub mod aead;
 pub mod handshake;
+pub mod async_pqc;

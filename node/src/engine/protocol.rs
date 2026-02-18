@@ -38,8 +38,10 @@ pub const FLAG_TUNNEL: u8    = 0x20;
 pub const FLAG_HANDSHAKE: u8 = 0x02;
 pub const FLAG_FRAGMENT: u8  = 0x01;
 
-/// Handshake timeout: 5 seconds to complete 3-message exchange
-pub const HANDSHAKE_TIMEOUT_NS: u64 = 5_000_000_000;
+/// Micro-ARQ retransmission interval: 250ms.
+/// Replaces the original 5-second dead-trap. ClientHello fragments are retransmitted
+/// every 250ms instead of resetting the entire handshake state.
+pub const HANDSHAKE_RETX_INTERVAL_NS: u64 = 250_000_000;
 /// Rekey after 2^32 frames under one session key
 pub const REKEY_FRAME_LIMIT: u64 = 1u64 << 32;
 /// Rekey after 1 hour under one session key
@@ -178,13 +180,7 @@ impl Assembler {
         Assembler { slots: ptr, mask: (ASM_SLOTS_PER_PEER - 1) as u16 }
     }
 
-    #[inline(always)]
-    pub fn clear_all(&mut self) {
-        if self.slots.is_null() { return; }
-        for i in 0..ASM_SLOTS_PER_PEER {
-            unsafe { (*self.slots.add(i)).active = false; }
-        }
-    }
+
 
     #[inline(always)]
     pub fn feed<F>(
@@ -200,11 +196,14 @@ impl Assembler {
         let slot_idx = ((msg_id ^ (msg_id >> 3)) & self.mask) as usize;
         let slot = unsafe { &mut *self.slots.add(slot_idx) };
 
-        if slot.msg_id != msg_id {
+        // SURGICAL PATCH: If the slot is inactive, it unconditionally belongs to the incoming msg_id.
+        // This prevents the zero-initialized memory (msg_id=0) from rejecting the first ServerHello.
+        // Original code: `else if !slot.active { return; }` — drops msg_id=0 on boot.
+        if slot.msg_id != msg_id || !slot.active {
             if !slot.active || now_ns.saturating_sub(slot.first_rx_ns) > 5_000_000_000 {
                 slot.reset(msg_id, total, now_ns);
             } else { return; }
-        } else if !slot.active { return; }
+        }
 
         let bit = 1u16 << index;
         if (slot.received_mask & bit) != 0 { return; }
@@ -319,6 +318,7 @@ pub fn send_fragmented_udp<F>(
     sent
 }
 
+
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -430,17 +430,6 @@ mod tests {
         free_asm_arena(arena, ASM_SLOTS_PER_PEER);
     }
 
-    #[test]
-    fn clear_all_resets_slots() {
-        let (mut asm, arena) = test_assembler();
-        let mut count = 0usize;
-        asm.feed(1, 0, 2, 0, b"A", 100, |_| count += 1);
-        asm.clear_all();
-        // After clear, the slot is inactive so feeding the same msg_id won't work
-        asm.feed(1, 1, 2, 1, b"B", 200, |_| count += 1);
-        assert_eq!(count, 0);
-        free_asm_arena(arena, ASM_SLOTS_PER_PEER);
-    }
 
     #[test]
     fn assembly_slot_size() {

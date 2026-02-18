@@ -408,6 +408,7 @@ fn classify_one(desc: &PacketDesc, stats: &mut CycleStats, closing: bool) -> Nex
 // ============================================================================
 
 /// Enqueue a vector of packets to the TX scheduler.
+/// V4: EDT pacing gates timing before scheduler enqueue.
 #[inline]
 pub fn tx_enqueue_vector(
     input: &PacketVector,
@@ -425,7 +426,13 @@ pub fn tx_enqueue_vector(
             ctx.rx_state.last_rx_batch_ns = ctx.now_ns;
             ctx.rx_bitmap.mark(desc.seq_id);
 
-            ctx.scheduler.enqueue_bulk(desc.addr, desc.len);
+            // V4: EDT pacing — compute release time per-packet (zero-spin)
+            let release_ns = if let Some(ref mut pacer) = ctx.pacer {
+                pacer.pace(ctx.now_ns, desc.len)
+            } else {
+                0
+            };
+            ctx.scheduler.enqueue_critical_edt(desc.addr, desc.len, release_ns);
             stats.data_fwd += 1;
         } else {
             ctx.slab.free((desc.addr / ctx.frame_size as u64) as u32);

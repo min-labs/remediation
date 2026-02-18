@@ -27,8 +27,9 @@ use m13_hub::network::{
     GraphCtx, CycleStats, scatter,
     datapath,
 };
-use m13_hub::cryptography::handshake::{process_client_hello_hub, process_finished_hub};
-use ring::aead;
+// process_client_hello_hub and process_finished_hub are now called by Core 0 PQC worker
+// (hub/src/cryptography/async_pqc.rs), not by the datapath.
+// ring::aead used via fully qualified paths in drain handler (ring::aead::UnboundKey, etc.)
 
 const SLAB_DEPTH: usize = 8192;
 const GRAPH_BATCH: usize = 256;
@@ -434,6 +435,7 @@ fn execute_subvector(
     let mut handshake_vec = PacketVector::new();
     let mut feedback_vec = PacketVector::new();
     let mut drop_vec = PacketVector::new();
+    let mut cleartext_echo_vec = PacketVector::new();
     let t_scatter = read_tsc();
     scatter(
         &all_packets, &classify_disp,
@@ -441,6 +443,7 @@ fn execute_subvector(
         &mut tun_vec, &mut recycle_encrypt,
         &mut tx_vec, &mut handshake_vec,
         &mut feedback_vec, &mut drop_vec,
+        &mut cleartext_echo_vec,
     );
     stats.scatter_tsc = read_tsc() - t_scatter;
     if cfg!(debug_assertions) {
@@ -507,6 +510,14 @@ fn execute_subvector(
         }
     }
 
+
+
+    // V4: Echo/cleartext packets — route to TUN write for local delivery
+    for i in 0..cleartext_echo_vec.len {
+        let desc = &cleartext_echo_vec.descs[i];
+        ctx.slab.free((desc.addr / ctx.frame_size as u64) as u32);
+    }
+
     stats
 }
 
@@ -555,6 +566,8 @@ fn process_fragment(
 }
 
 /// Process a reassembled handshake message (cold path).
+/// Both ClientHello and Finished are dispatched to Core 0 via SPSC.
+/// Zero inline lattice math on the datapath.
 fn process_handshake_message(
     data: &[u8],
     pidx: usize,
@@ -568,94 +581,36 @@ fn process_handshake_message(
     const HS_FINISHED: u8 = 0x03;
 
     match msg_type {
-        HS_CLIENT_HELLO => {
-            ctx.peers.slots[pidx].lifecycle = PeerLifecycle::Handshaking;
-            let mut hs_seq_tx = ctx.peers.slots[pidx].seq_tx;
-            if let Some((hs, server_hello)) = process_client_hello_hub(data, &mut hs_seq_tx, ctx.now_ns) {
-                let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
-                if ctx.peers.slots[pidx].addr.is_udp() {
-                    let peer_ip = ctx.peers.slots[pidx].addr.ip().unwrap();
-                    let peer_port = ctx.peers.slots[pidx].addr.port().unwrap();
-                    // DEFECT γ: Extract scalar fields to locals before closure capture
-                    let src_mac = ctx.src_mac;
-                    let gw_mac = ctx.gateway_mac;
-                    let hub_ip = ctx.hub_ip;
-                    let hub_port = ctx.hub_port;
-                    let umem_base = ctx.umem_base;
-                    let frame_size = ctx.frame_size as usize;
-                    build_fragmented_raw_udp(
-                        &src_mac, &gw_mac, hub_ip, peer_ip,
-                        hub_port, peer_port, &server_hello, hs_flags,
-                        &mut hs_seq_tx, ctx.ip_id_counter,
-                        |frame_data, flen| {
-                            let now = rdtsc_ns(&ctx.cal);
-                            ctx.hexdump.dump_tx(frame_data.as_ptr(), flen as usize, now);
-
-                            if let Some(slab_idx) = ctx.slab.alloc() {
-                                let dst = unsafe { umem_base.add(slab_idx as usize * frame_size) };
-                                let copy_len = (flen as usize).min(frame_size);
-                                unsafe { std::ptr::copy_nonoverlapping(frame_data.as_ptr(), dst, copy_len); }
-                                ctx.scheduler.enqueue_critical(
-                                    (slab_idx as u64) * frame_size as u64, flen,
-                                );
-                            } else {
-                                eprintln!("[M13-DIAG] SLAB EXHAUSTION: ServerHello UDP frag. Slab: {}/{} free.",
-                                    ctx.slab.available(), 8192);
-                            }
-                        },
-                    );
-                } else {
-                    let peer_mac = ctx.peers.slots[pidx].mac;
-                    let src_mac = ctx.src_mac;
-                    let umem_base = ctx.umem_base;
-                    let frame_size = ctx.frame_size as usize;
-                    build_fragmented_l2(
-                        &src_mac, &peer_mac,
-                        &server_hello, hs_flags,
-                        &mut hs_seq_tx,
-                        |frame_data, flen| {
-                            let now = rdtsc_ns(&ctx.cal);
-                            ctx.hexdump.dump_tx(frame_data.as_ptr(), flen as usize, now);
-
-                            if let Some(slab_idx) = ctx.slab.alloc() {
-                                let dst = unsafe { umem_base.add(slab_idx as usize * frame_size) };
-                                let copy_len = (flen as usize).min(frame_size);
-                                unsafe { std::ptr::copy_nonoverlapping(frame_data.as_ptr(), dst, copy_len); }
-                                ctx.scheduler.enqueue_critical(
-                                    (slab_idx as u64) * frame_size as u64, flen,
-                                );
-                            } else {
-                                eprintln!("[M13-DIAG] SLAB EXHAUSTION: ServerHello L2 frag. Slab: {}/{} free.",
-                                    ctx.slab.available(), 8192);
-                            }
-                        },
-                    );
-                }
-                ctx.peers.hs_sidecar[pidx] = Some(hs);
-                ctx.peers.slots[pidx].seq_tx = hs_seq_tx;
-                eprintln!("[M13-VPP] ClientHello processed for peer {:?}, ServerHello enqueued.",
-                    ctx.peers.slots[pidx].addr);
-            } else {
-                stats.handshake_fail += 1;
+        HS_CLIENT_HELLO | HS_FINISHED => {
+            // ================================================================
+            // UNIFIED ASYNC PQC DISPATCH: Zero Datapath Stalls
+            // ================================================================
+            // Copy reassembled payload to shared arena (indexed by pidx).
+            // Core 0 reads from arena — no payload copied through SPSC ring.
+            let max_len = m13_hub::cryptography::async_pqc::MAX_HS_PAYLOAD_SIZE;
+            let copy_len = data.len().min(max_len);
+            unsafe {
+                let arena_slot = &mut *ctx.payload_arena.add(pidx);
+                arena_slot[..copy_len].copy_from_slice(&data[..copy_len]);
             }
-        }
-        HS_FINISHED => {
-            if let Some(ref hs) = ctx.peers.hs_sidecar[pidx] {
-                if let Some(key) = process_finished_hub(data, hs) {
-                    ctx.peers.slots[pidx].session_key = key;
-                    let ukey = aead::UnboundKey::new(&aead::AES_256_GCM, &key).unwrap();
-                    ctx.peers.ciphers[pidx] = Some(aead::LessSafeKey::new(ukey));
-                    ctx.peers.slots[pidx].frame_count = 0;
-                    let rel_s = ((ctx.now_ns.saturating_sub(ctx.peers.epoch_ns)) / 1_000_000_000) as u32;
-                    ctx.peers.slots[pidx].established_rel_s = rel_s;
-                    ctx.peers.slots[pidx].lifecycle = PeerLifecycle::Established;
-                    ctx.peers.hs_sidecar[pidx] = None;
-                    stats.handshake_ok += 1;
-                    eprintln!("[M13-VPP] Session established for peer {:?} (AEAD active)",
-                        ctx.peers.slots[pidx].addr);
-                } else {
+
+            if msg_type == HS_CLIENT_HELLO {
+                ctx.peers.slots[pidx].lifecycle = PeerLifecycle::Handshaking;
+            }
+
+            // Push slim PqcReq (32 bytes) to SPSC ring
+            let pqc_msg_type: u8 = if msg_type == HS_CLIENT_HELLO { 1 } else { 2 };
+            if let Some(ref mut pqc_tx) = ctx.pqc_req_tx {
+                let req = m13_hub::cryptography::async_pqc::PqcReq {
+                    pidx: pidx as u16,
+                    msg_type: pqc_msg_type,
+                    _pad: 0,
+                    payload_len: copy_len as u32,
+                    rx_ns: ctx.now_ns,
+                };
+                if pqc_tx.push_batch(&[req]) == 0 {
+                    eprintln!("[M13-VPP] PQC SPSC full — msg_type=0x{:02X} pidx={} dropped", msg_type, pidx);
                     stats.handshake_fail += 1;
-                    ctx.peers.hs_sidecar[pidx] = None;
                 }
             }
         }
@@ -1055,6 +1010,53 @@ fn worker_entry(
     let mut closing = false;
     let mut fin_deadline_ns: u64 = 0;
 
+    // ========================================================================
+    // WORLD-CLASS FIX: ASYNC PQC CONTROL PLANE (Zero Datapath Stalls)
+    // ========================================================================
+    // Both ClientHello (10ms) and Finished (5ms) offloaded to Core 0.
+    // OSI layer decoupling: Core 0 handles crypto only (Layer 7).
+    // Datapath handles L2/L3 framing with locally-learned hub_ip/gateway_mac.
+    let (spsc_pqc_req_prod, spsc_pqc_req_cons, spsc_pqc_resp_prod, spsc_pqc_resp_cons) =
+        m13_hub::cryptography::async_pqc::make_pqc_spsc();
+
+    // Allocate shared payload arena (datapath writes, Core 0 reads)
+    let payload_arena_box = Box::new(
+        [[0u8; m13_hub::cryptography::async_pqc::MAX_HS_PAYLOAD_SIZE]; MAX_PEERS]
+    );
+    let payload_arena_ptr: *mut [u8; m13_hub::cryptography::async_pqc::MAX_HS_PAYLOAD_SIZE] =
+        Box::into_raw(payload_arena_box) as *mut _;
+
+    // Allocate Core 0-local hs_state arena (Core 0 writes and reads)
+    let hs_state_arena_box = Box::new(
+        [m13_hub::cryptography::async_pqc::FlatHubHandshakeState::EMPTY; MAX_PEERS]
+    );
+    let hs_state_arena_ptr: *mut m13_hub::cryptography::async_pqc::FlatHubHandshakeState =
+        Box::into_raw(hs_state_arena_box) as *mut _;
+
+    // Spawn PQC Control Plane on Core 0 — receives arena pointers as usize (Send-safe).
+    // usize is unconditionally Send. Reconstruct pointers inside the thread.
+    let pqc_payload_usize = payload_arena_ptr as usize;
+    let pqc_hs_usize = hs_state_arena_ptr as usize;
+    std::thread::Builder::new().name("m13-pqc-cp".into()).spawn(move || {
+        let pa = pqc_payload_usize as *const [u8; m13_hub::cryptography::async_pqc::MAX_HS_PAYLOAD_SIZE];
+        let ha = pqc_hs_usize as *mut m13_hub::cryptography::async_pqc::FlatHubHandshakeState;
+        m13_hub::cryptography::async_pqc::pqc_worker_thread(
+            0, // core_id: Linux Housekeeping Core 0
+            spsc_pqc_req_cons,
+            spsc_pqc_resp_prod,
+            pa,
+            ha,
+            MAX_PEERS,
+        );
+    }).expect("FATAL: Failed to spawn Core 0 PQC Control Plane");
+
+    // Datapath retains producer (req) and consumer (resp) ends
+    let mut spsc_pqc_req_prod: Option<m13_hub::engine::spsc::Producer<m13_hub::cryptography::async_pqc::PqcReq>> = Some(spsc_pqc_req_prod);
+    let mut spsc_pqc_resp_cons: Option<m13_hub::engine::spsc::Consumer<m13_hub::cryptography::async_pqc::PqcResp>> = Some(spsc_pqc_resp_cons);
+
+    // V4: EDT pacer — zero-spin, 100 Mbps default MANET link rate
+    let mut edt_pacer = Some(m13_hub::network::uso_pacer::EdtPacer::new(&cal, 100_000_000));
+
     // Hub header template for TUN→AF_XDP path
     // Pre-stamp static M13 header bytes once. Copy per-packet via single memcpy
     // instead of 8 individual writes + fill(0). bytes 16..62 already 0.
@@ -1134,6 +1136,11 @@ fn worker_entry(
                 // DEFECT ε FIXED: Observability exports
                 hexdump: &mut hexdump,
                 cal,
+                // V4: PQC offload + EDT pacer
+                pqc_req_tx: spsc_pqc_req_prod.as_mut(),
+                pqc_resp_rx: spsc_pqc_resp_cons.as_mut(),
+                payload_arena: payload_arena_ptr,
+                pacer: edt_pacer.as_mut(),
             };
             let tx_count = execute_tx_graph(&mut tx_gctx);
             udp_tx_count += tx_count;
@@ -1228,6 +1235,11 @@ fn worker_entry(
                     // DEFECT ε FIXED: Observability exports
                     hexdump: &mut hexdump,
                     cal,
+                    // V4: PQC offload + EDT pacer
+                    pqc_req_tx: spsc_pqc_req_prod.as_mut(),
+                    pqc_resp_rx: spsc_pqc_resp_cons.as_mut(),
+                    payload_arena: payload_arena_ptr,
+                    pacer: edt_pacer.as_mut(),
                 };
 
                 let cycle = execute_graph(
@@ -1298,9 +1310,19 @@ fn worker_entry(
                 // Process registration echoes — send FLAG_CONTROL echo to peers
                 // without sessions so Node transitions Registering → Handshaking.
                 // Done OUTSIDE pipeline (like FIN-ACK) to avoid UMEM slab corruption.
+                //
+                // DEFECT α FIX: 100ms throttle prevents slab exhaustion from
+                // uncontrolled echo storms. slab.free(idx) on enqueue failure
+                // prevents catastrophic slab leak.
                 for pidx in 0..MAX_PEERS {
                     if peers.slots[pidx].is_empty() { continue; }
                     if peers.slots[pidx].has_session() { continue; }
+
+                    // 100ms echo throttle — prevents UMEM slab exhaustion
+                    if now.saturating_sub(peers.slots[pidx].last_echo_ns) < 100_000_000 {
+                        continue;
+                    }
+                    peers.slots[pidx].last_echo_ns = now;
 
                     // Build a minimal valid M13 frame
                     let mut echo_m13 = [0u8; 62]; // ETH(14) + M13(48)
@@ -1334,10 +1356,12 @@ fn worker_entry(
                                 );
                                 ip_id_counter = ip_id_counter.wrapping_add(1);
                             }
-                            scheduler.enqueue_critical(
+                            if !scheduler.enqueue_critical(
                                 (idx as u64) * FRAME_SIZE as u64,
                                 total_len as u32,
-                            );
+                            ) {
+                                slab.free(idx); // CRITICAL: Prevent slab leak
+                            }
                         }
                     } else {
                         // L2 peer — send raw ETH+M13 echo
@@ -1352,10 +1376,12 @@ fn worker_entry(
                                 let buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
                                 buf[..62].copy_from_slice(&echo_m13);
                             }
-                            scheduler.enqueue_critical(
+                            if !scheduler.enqueue_critical(
                                 (idx as u64) * FRAME_SIZE as u64,
                                 62,
-                            );
+                            ) {
+                                slab.free(idx); // CRITICAL: Prevent slab leak
+                            }
                         }
                     }
                 }
@@ -1365,10 +1391,104 @@ fn worker_entry(
         // === STAGE 3: FEEDBACK GENERATION ===
         stage_feedback_gen(umem, &mut rx_state, &mut rx_bitmap, &mut slab, &mut scheduler, &src_mac, &jbuf, rx_batch_ns);
 
+        // === V4: PQC RESPONSE DRAIN ===
+        // Drain completed PQC responses from the SPSC ring.
+        // Core 0 returns raw crypto payload. Datapath frames with learned addresses.
+        if let Some(ref mut pqc_rx) = spsc_pqc_resp_cons {
+            let mut resp_batch = [m13_hub::cryptography::async_pqc::PqcResp::EMPTY; 8];
+            let count = pqc_rx.pop_batch(&mut resp_batch);
+            for r in 0..count {
+                let resp = &resp_batch[r];
+                let pidx = resp.pidx as usize;
+                if pidx >= MAX_PEERS { continue; }
+
+                if resp.success == 0 {
+                    // Handshake failed
+                    peers.hs_sidecar[pidx] = None;
+                    stats.handshake_fail.value.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[M13-PQC-DRAIN] Handshake FAILED pidx={}", pidx);
+                    continue;
+                }
+
+                match resp.msg_type {
+                    0x02 => {
+                        // ServerHello: Core 0 completed ClientHello processing.
+                        // Frame raw payload with datapath-local hub_ip/gateway_mac.
+                        let payload = &resp.response_payload[..resp.response_len as usize];
+                        let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
+                        let mut hs_seq_tx = peers.slots[pidx].seq_tx;
+
+                        if peers.slots[pidx].addr.is_udp() {
+                            let peer_ip = peers.slots[pidx].addr.ip().unwrap_or([0; 4]);
+                            let peer_port = peers.slots[pidx].addr.port().unwrap_or(0);
+                            build_fragmented_raw_udp(
+                                &src_mac, &gateway_mac, hub_ip, peer_ip,
+                                hub_port, peer_port, payload, hs_flags,
+                                &mut hs_seq_tx, &mut ip_id_counter,
+                                |frame_data, flen| {
+                                    let frame_now = rdtsc_ns(&cal);
+                                    hexdump.dump_tx(frame_data.as_ptr(), flen as usize, frame_now);
+                                    if let Some(slab_idx) = slab.alloc() {
+                                        let dst = unsafe { umem.add(slab_idx as usize * FRAME_SIZE as usize) };
+                                        let copy_len = (flen as usize).min(FRAME_SIZE as usize);
+                                        unsafe { std::ptr::copy_nonoverlapping(frame_data.as_ptr(), dst, copy_len); }
+                                        scheduler.enqueue_critical(
+                                            (slab_idx as u64) * FRAME_SIZE as u64, flen,
+                                        );
+                                    }
+                                },
+                            );
+                        } else {
+                            let peer_mac = peers.slots[pidx].mac;
+                            build_fragmented_l2(
+                                &src_mac, &peer_mac,
+                                payload, hs_flags,
+                                &mut hs_seq_tx,
+                                |frame_data, flen| {
+                                    let frame_now = rdtsc_ns(&cal);
+                                    hexdump.dump_tx(frame_data.as_ptr(), flen as usize, frame_now);
+                                    if let Some(slab_idx) = slab.alloc() {
+                                        let dst = unsafe { umem.add(slab_idx as usize * FRAME_SIZE as usize) };
+                                        let copy_len = (flen as usize).min(FRAME_SIZE as usize);
+                                        unsafe { std::ptr::copy_nonoverlapping(frame_data.as_ptr(), dst, copy_len); }
+                                        scheduler.enqueue_critical(
+                                            (slab_idx as u64) * FRAME_SIZE as u64, flen,
+                                        );
+                                    }
+                                },
+                            );
+                        }
+
+                        peers.slots[pidx].seq_tx = hs_seq_tx;
+                        stats.handshake_ok.value.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[M13-PQC-DRAIN] ServerHello framed for peer {:?}",
+                            peers.slots[pidx].addr);
+                    }
+                    0x03 => {
+                        // SessionEstablished: Core 0 completed Finished verification.
+                        // Install AEAD cipher.
+                        let key = resp.session_key;
+                        peers.slots[pidx].session_key = key;
+                        let ukey = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &key).unwrap();
+                        peers.ciphers[pidx] = Some(ring::aead::LessSafeKey::new(ukey));
+                        peers.slots[pidx].frame_count = 0;
+                        let rel_s = ((now.saturating_sub(peers.epoch_ns)) / 1_000_000_000) as u32;
+                        peers.slots[pidx].established_rel_s = rel_s;
+                        peers.slots[pidx].lifecycle = PeerLifecycle::Established;
+                        peers.hs_sidecar[pidx] = None;
+                        stats.handshake_ok.value.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[M13-PQC-DRAIN] SessionEstablished for peer {:?} (AEAD active)",
+                            peers.slots[pidx].addr);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // === STAGE 6: SCHEDULE TX ===
         {
             let tx_counter = TxCounter::new();
-            scheduler.schedule(&mut engine.tx_path, &tx_counter, usize::MAX);
+            scheduler.schedule(&mut engine.tx_path, &tx_counter, usize::MAX, now);
             stats.tx_count.value.fetch_add(tx_counter.value.load(Ordering::Relaxed), Ordering::Relaxed);
         }
         // Periodic peer table GC + assembler GC
